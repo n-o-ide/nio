@@ -1,0 +1,8 @@
+/target/
+**/.env
+**/.env.*
+!.env.example
+/config.json
+/.nio/
+*.log
+.DS_Store
