@@ -770,14 +770,26 @@ struct MarkdownFormatter {
     enabled: bool,
     pending: String,
     bold: bool,
+    wrap_width: usize,
+    column: usize,
 }
 
 impl MarkdownFormatter {
     fn new(enabled: bool) -> Self {
+        let wrap_width = if enabled {
+            terminal::size()
+                .map(|(width, _)| width as usize)
+                .unwrap_or(80)
+                .max(20)
+        } else {
+            usize::MAX
+        };
         Self {
             enabled,
             pending: String::new(),
             bold: false,
+            wrap_width,
+            column: 6,
         }
     }
 
@@ -814,9 +826,61 @@ impl MarkdownFormatter {
                 break;
             }
             let character = self.pending.remove(0);
+            if character == '\n' {
+                output.push(character);
+                self.column = 6;
+                continue;
+            }
+            let width = terminal_character_width(character);
+            if width > 0 && self.column.saturating_add(width) >= self.wrap_width {
+                output.push('\n');
+                self.column = 6;
+            }
             output.push(character);
+            self.column = self.column.saturating_add(width);
         }
         output
+    }
+}
+
+fn terminal_character_width(character: char) -> usize {
+    let code = character as u32;
+    if character.is_control()
+        || matches!(code, 0x0300..=0x036F | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0xFE00..=0xFE0F)
+    {
+        return 0;
+    }
+    if matches!(
+        code,
+        0x1100..=0x115F
+            | 0x2329..=0x232A
+            | 0x2E80..=0xA4CF
+            | 0xAC00..=0xD7A3
+            | 0xF900..=0xFAFF
+            | 0xFE10..=0xFE6F
+            | 0xFF00..=0xFF60
+            | 0x1F300..=0x1FAFF
+    ) {
+        2
+    } else {
+        1
+    }
+}
+
+fn compact_tool_messages(messages: &mut [Value]) {
+    for message in messages {
+        if message.get("role").and_then(Value::as_str) != Some("tool") {
+            continue;
+        }
+        let Some(content) = message.get("content").and_then(Value::as_str) else {
+            continue;
+        };
+        if content.chars().count() > 1_600 {
+            message["content"] = json!(format!(
+                "{}\n[Tool output shortened to make room for the final response.]",
+                truncate(content, 1_600)
+            ));
+        }
     }
 }
 
@@ -855,6 +919,70 @@ fn process_sse_line(
             }
             call.name.push_str(&partial.function.name);
             call.arguments.push_str(&partial.function.arguments);
+        }
+    }
+    Ok(())
+}
+
+fn process_json_completion(
+    payload: Value,
+    options: &Options,
+    answer: &mut String,
+    tools: &mut std::collections::BTreeMap<usize, PendingToolCall>,
+    response_started: &mut bool,
+    formatter: &mut MarkdownFormatter,
+) -> Result<(), String> {
+    let Some(choice) = payload
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|x| x.first())
+    else {
+        return Err("provider returned a JSON response without a completion choice".into());
+    };
+    if let Some(content) = choice
+        .pointer("/message/content")
+        .and_then(Value::as_str)
+        .or_else(|| choice.get("text").and_then(Value::as_str))
+    {
+        if !content.is_empty() {
+            emit_assistant_start(options)?;
+            *response_started = true;
+            answer.push_str(content);
+            let formatted = formatter.push(content);
+            if !formatted.is_empty() {
+                emit_text(options, &formatted)?;
+            }
+        }
+    }
+    if let Some(calls) = choice
+        .pointer("/message/tool_calls")
+        .and_then(Value::as_array)
+    {
+        for (index, call) in calls.iter().enumerate() {
+            let function = call.get("function").unwrap_or(&Value::Null);
+            let arguments = match function.get("arguments") {
+                Some(Value::String(arguments)) => serde_json::from_str(arguments)
+                    .unwrap_or_else(|_| json!({"_invalid_arguments": arguments})),
+                Some(arguments) => arguments.clone(),
+                None => json!({}),
+            };
+            tools.insert(
+                index,
+                PendingToolCall {
+                    id: call
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("json-tool-{index}")),
+                    name: function
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    arguments: arguments.to_string(),
+                    ..PendingToolCall::default()
+                },
+            );
         }
     }
     Ok(())
@@ -1302,14 +1430,15 @@ async fn request_followup_suggestions(
         .filter_map(|message| {
             let role = message.get("role")?.as_str()?;
             let content = message.get("content")?.as_str()?;
-            matches!(role, "user" | "assistant").then(|| json!({"role":role,"content":content}))
+            matches!(role, "user" | "assistant")
+                .then(|| json!({"role":role,"content":truncate(content, 1800)}))
         })
-        .take(8)
+        .take(6)
         .collect::<Vec<_>>();
     context.reverse();
     let mut messages = vec![json!({
         "role":"system",
-        "content":"Suggest up to three concise, useful follow-up prompts the user could choose next, based on this conversation. Return one prompt per line, each beginning with '- '. Make the prompts specific, distinct, and each under 100 characters. Do not add a heading or explanation."
+        "content":"Suggest two or three concise next-step prompts based specifically on the latest user request and assistant answer. Each must refer to details from this conversation and offer a distinct action; do not use generic prompts such as reviewing key files or explaining components unless directly relevant. Return only a JSON array of strings, with each prompt under 100 characters."
     })];
     messages.extend(context);
 
@@ -1377,25 +1506,7 @@ async fn request_followup_suggestions(
         .pointer("/choices/0/message/content")
         .and_then(Value::as_str)
         .ok_or("model returned no suggestions")?;
-    let mut suggestions = content
-        .find('{')
-        .zip(content.rfind('}'))
-        .and_then(|(start, end)| serde_json::from_str::<Value>(&content[start..=end]).ok())
-        .and_then(|value| value.get("suggestions")?.as_array().cloned())
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::trim)
-                .filter(|suggestion| !suggestion.is_empty())
-                .take(3)
-                .map(|suggestion| truncate(suggestion, 100))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    if suggestions.len() != 3 {
-        suggestions = parse_followup_lines(content);
-    }
+    let suggestions = parse_followup_suggestions(content);
     Ok(complete_followups(suggestions))
 }
 
@@ -1421,19 +1532,57 @@ fn complete_followups(mut suggestions: Vec<String>) -> Vec<String> {
     suggestions
 }
 
-fn parse_followup_lines(content: &str) -> Vec<String> {
+fn parse_followup_suggestions(content: &str) -> Vec<String> {
+    let trimmed = content.trim().trim_matches('`').trim();
+    let json_value = serde_json::from_str::<Value>(trimmed).ok().or_else(|| {
+        let start = trimmed.find('[')?;
+        let end = trimmed.rfind(']')?;
+        serde_json::from_str::<Value>(&trimmed[start..=end]).ok()
+    });
+    let from_json = json_value
+        .as_ref()
+        .and_then(|value| {
+            value.as_array().or_else(|| {
+                value
+                    .get("suggestions")
+                    .or_else(|| value.get("follow_ups"))
+                    .and_then(Value::as_array)
+            })
+        })
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .take(3)
+                .map(|item| truncate(item, 100))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if !from_json.is_empty() {
+        return from_json;
+    }
+
     content
         .lines()
         .filter_map(|line| {
-            let mut line = line.trim().trim_matches('`').trim();
-            if line.starts_with('{') || line.starts_with('}') {
+            let mut line = line
+                .trim()
+                .trim_matches(|ch: char| matches!(ch, '`' | '"' | '\''))
+                .trim();
+            let lower = line.to_ascii_lowercase();
+            if line.is_empty()
+                || line.starts_with(['{', '}', '[', ']'])
+                || ["here are", "suggestions:", "follow-ups:", "based on this"]
+                    .iter()
+                    .any(|prefix| lower.starts_with(prefix))
+            {
                 return None;
             }
-            let mut has_list_marker = false;
             for prefix in ["- ", "* ", "• "] {
                 if let Some(item) = line.strip_prefix(prefix) {
                     line = item.trim();
-                    has_list_marker = true;
                     break;
                 }
             }
@@ -1442,13 +1591,9 @@ fn parse_followup_lines(content: &str) -> Vec<String> {
                 .filter(|end| *end > 0 && line[..*end].chars().all(|ch| ch.is_ascii_digit()));
             if let Some(end) = number_end {
                 line = line[end + 1..].trim();
-                has_list_marker = true;
-            }
-            if !has_list_marker {
-                return None;
             }
             let line = line.trim_matches(|ch: char| matches!(ch, '`' | '*' | '"' | '\''));
-            (!line.is_empty()).then(|| truncate(line, 100))
+            (line.split_whitespace().count() >= 3).then(|| truncate(line, 100))
         })
         .take(3)
         .collect()
@@ -1536,6 +1681,7 @@ async fn run_agent_turn_inner(
     } else {
         json!([])
     };
+    let mut retried_empty_response = false;
     loop {
         let mut retry_count = 0u32;
         let response = loop {
@@ -1597,21 +1743,44 @@ async fn run_agent_turn_inner(
             let body = response.text().await.unwrap_or_default();
             return Err(format_provider_error(status.as_u16(), &body, gateway));
         }
-        let mut stream = response.bytes_stream();
-        let mut buffer = Vec::new();
         let mut answer = String::new();
         let mut response_started = false;
         let mut formatter =
             MarkdownFormatter::new(!options.json_output && io::stdout().is_terminal());
         let mut pending_tools = std::collections::BTreeMap::<usize, PendingToolCall>::new();
-        while let Some(part) = stream.next().await {
-            let bytes = part.map_err(|e| format!("response stream failed: {e}"))?;
-            buffer.extend_from_slice(&bytes);
-            while let Some(pos) = buffer.iter().position(|byte| *byte == b'\n') {
-                let line = String::from_utf8_lossy(&buffer[..pos])
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_ascii_lowercase);
+        let is_event_stream = content_type
+            .as_deref()
+            .is_none_or(|value| value.contains("text/event-stream"));
+        if is_event_stream {
+            let mut stream = response.bytes_stream();
+            let mut buffer = Vec::new();
+            while let Some(part) = stream.next().await {
+                let bytes = part.map_err(|e| format!("response stream failed: {e}"))?;
+                buffer.extend_from_slice(&bytes);
+                while let Some(pos) = buffer.iter().position(|byte| *byte == b'\n') {
+                    let line = String::from_utf8_lossy(&buffer[..pos])
+                        .trim_end_matches('\r')
+                        .to_string();
+                    buffer.drain(..=pos);
+                    process_sse_line(
+                        &line,
+                        options,
+                        &mut answer,
+                        &mut pending_tools,
+                        &mut response_started,
+                        &mut formatter,
+                    )?;
+                }
+            }
+            if !buffer.is_empty() {
+                let line = String::from_utf8_lossy(&buffer)
                     .trim_end_matches('\r')
                     .to_string();
-                buffer.drain(..=pos);
                 process_sse_line(
                     &line,
                     options,
@@ -1621,13 +1790,13 @@ async fn run_agent_turn_inner(
                     &mut formatter,
                 )?;
             }
-        }
-        if !buffer.is_empty() {
-            let line = String::from_utf8_lossy(&buffer)
-                .trim_end_matches('\r')
-                .to_string();
-            process_sse_line(
-                &line,
+        } else {
+            let payload = response
+                .json::<Value>()
+                .await
+                .map_err(|error| format!("invalid provider completion response: {error}"))?;
+            process_json_completion(
+                payload,
                 options,
                 &mut answer,
                 &mut pending_tools,
@@ -1664,10 +1833,18 @@ async fn run_agent_turn_inner(
         }
         if calls.is_empty() {
             if answer.trim().is_empty() {
-                return Err(
-                    "the model returned an empty response; try again or switch models with :model"
-                        .into(),
-                );
+                if !retried_empty_response {
+                    retried_empty_response = true;
+                    compact_tool_messages(&mut messages);
+                    compact_tool_messages(history);
+                    emit_status(
+                        options,
+                        "retrying",
+                        "Provider completed without an answer; requesting the final response again",
+                    );
+                    continue;
+                }
+                return Err("The provider completed without sending answer text or another tool call, even after one retry. Earlier project tool results were preserved; try again or switch models with :model.".into());
             }
             if options.json_output {
                 emit_status(options, "working", "Finishing response");
@@ -2197,11 +2374,35 @@ struct PaletteScreen {
     active: bool,
 }
 
-struct MouseCaptureGuard;
+struct MouseCaptureGuard {
+    enabled: bool,
+}
+
+impl MouseCaptureGuard {
+    fn disable(&mut self, stdout: &mut io::Stdout) -> Result<(), String> {
+        if self.enabled {
+            execute!(stdout, DisableMouseCapture)
+                .map_err(|error| format!("disabling mouse capture for scrollback: {error}"))?;
+            self.enabled = false;
+        }
+        Ok(())
+    }
+
+    fn enable(&mut self, stdout: &mut io::Stdout) -> Result<(), String> {
+        if !self.enabled {
+            execute!(stdout, EnableMouseCapture)
+                .map_err(|error| format!("enabling follow-up button clicks: {error}"))?;
+            self.enabled = true;
+        }
+        Ok(())
+    }
+}
 
 impl Drop for MouseCaptureGuard {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), DisableMouseCapture);
+        if self.enabled {
+            let _ = execute!(io::stdout(), DisableMouseCapture);
+        }
     }
 }
 
@@ -2306,12 +2507,12 @@ fn read_interactive_line_raw(
     suggestions: &[String],
 ) -> Result<PromptInput, String> {
     let mut stdout = io::stdout();
-    let _mouse_capture = if suggestions.is_empty() {
+    let mut mouse_capture = if suggestions.is_empty() {
         None
     } else {
         execute!(stdout, EnableMouseCapture)
             .map_err(|error| format!("enabling follow-up buttons: {error}"))?;
-        Some(MouseCaptureGuard)
+        Some(MouseCaptureGuard { enabled: true })
     };
     let mut input = String::new();
     let mut selected = 0usize;
@@ -2335,6 +2536,18 @@ fn read_interactive_line_raw(
     loop {
         let event = event::read().map_err(|e| format!("reading prompt input: {e}"))?;
         if let Event::Mouse(mouse) = &event {
+            if matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp
+                    | MouseEventKind::ScrollDown
+                    | MouseEventKind::ScrollLeft
+                    | MouseEventKind::ScrollRight
+            ) {
+                if let Some(capture) = mouse_capture.as_mut() {
+                    capture.disable(&mut stdout)?;
+                }
+                continue;
+            }
             if !palette.active
                 && mouse.kind == MouseEventKind::Down(MouseButton::Left)
                 && first_suggestion_row.is_some_and(|first_row| {
@@ -2361,6 +2574,9 @@ fn read_interactive_line_raw(
         let Event::Key(key) = event else { continue };
         if key.kind == KeyEventKind::Release {
             continue;
+        }
+        if let Some(capture) = mouse_capture.as_mut() {
+            capture.enable(&mut stdout)?;
         }
 
         let command_suggestions = command_suggestions(&input);
