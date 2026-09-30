@@ -25,7 +25,7 @@ Running `nio` starts a lightweight, line-based coding agent. Before accessing a 
 nio
 ```
 
-Use `:clear` to clear the interactive conversation and `:quit` to exit. File tools stay inside the current directory. Automatic listing/search skips common generated folders, secret filenames, and paths matched by `.gitignore`; individual file reads and writes are limited to 512 KiB. Each search reads at most 16 MiB and returns at most 50 matches. Ignore parsing is bounded to 256 KiB across the scan.
+Use `:clear` to clear the interactive conversation, `:diff` to review git changes, `:undo` to revert file mutations made by Nio, and `:quit` to exit. File tools stay inside the current directory. Automatic listing/search skips common generated folders, secret filenames, and paths matched by `.gitignore`; individual file reads and writes are limited to 512 KiB. Each search reads at most 16 MiB and returns at most 50 matches. Ignore parsing is bounded to 256 KiB across the scan.
 
 To see the model catalog at any time, run `nio models`. Free models appear first when the provider reports free status or zero pricing. Each choice shows its model name and gateway; Nio routes requests through the selected gateway automatically. You can override the saved model with `-m`:
 
@@ -44,9 +44,9 @@ nio run -m aihubmix::provider/model "Summarize this repository"
 
 In the interactive CLI, enter `:bash` or `:command` to switch to a direct shell prompt in the project directory; enter `:ai` to return to Nio.
 
-Shell commands currently require `sh` and are supported on Unix-like systems. Native Windows shell support is pending; Windows builds should not be treated as fully supported until the command runner is available and validated there.
+Shell commands use `sh` on Unix-like systems and `cmd.exe` on Windows. Command execution uses bounded capture, a 120-second timeout, and clean process group termination on cancellation.
 
-Enter `:path` (alias `:workingpath`) to show the current project directory.
+Enter `:path` (alias `:workingpath`) to show the current project directory. Enter `:undo` to roll back the last agent file mutation. Enter `:diff` to see the current git diff.
 
 Use `:proxy` to route all model API requests through an HTTP or HTTPS proxy, or set `NIO_PROXY` to override the saved proxy. Its local presets are Tinyproxy at `http://127.0.0.1:8888` and Squid at `http://127.0.0.1:3128`; install and start the selected service first. The connectivity check probes Kilo and each configured provider's `/models` endpoint without sending API keys. Use a standard HTTP(S) proxy that supports CONNECT tunnels for HTTPS traffic; a CORS relay is not a general-purpose API proxy. Use only a proxy you own or are authorized to use; public proxies can observe prompts and authorization headers. Nio does not bundle or recommend a free public proxy.
 

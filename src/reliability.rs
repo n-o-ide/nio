@@ -380,25 +380,110 @@ pub fn preview(old: &[u8], new: &str) -> String {
         .zip(after[prefix..].iter().rev())
         .take_while(|(a, b)| a == b)
         .count();
-    let mut output = format!("@@ from line {} @@\n", prefix + 1);
-    for (sign, lines) in [
-        ("-", &before[prefix..before.len() - suffix]),
-        ("+", &after[prefix..after.len() - suffix]),
-    ] {
-        for line in lines.iter().take(30) {
-            output.push_str(sign);
-            output.extend(
-                line.chars()
-                    .take(200)
-                    .filter(|c| !c.is_control() || *c == '\t'),
-            );
-            output.push('\n');
-        }
-        if lines.len() > 30 {
-            output.push_str("[additional changed lines omitted]\n");
-        }
+    let mut output = format!("\x1b[36m@@ from line {} @@\x1b[0m\n", prefix + 1);
+    for line in &before[prefix..before.len() - suffix] {
+        output.push_str("\x1b[31m-");
+        output.extend(
+            line.chars()
+                .take(200)
+                .filter(|c| !c.is_control() || *c == '\t'),
+        );
+        output.push_str("\x1b[0m\n");
+    }
+    for line in &after[prefix..after.len() - suffix] {
+        output.push_str("\x1b[32m+");
+        output.extend(
+            line.chars()
+                .take(200)
+                .filter(|c| !c.is_control() || *c == '\t'),
+        );
+        output.push_str("\x1b[0m\n");
+    }
+    if before[prefix..before.len() - suffix].len() > 30 || after[prefix..after.len() - suffix].len() > 30 {
+        output.push_str("\x1b[2m[additional changed lines omitted]\x1b[0m\n");
     }
     output
+}
+
+pub fn apply_patch(
+    file_content: &str,
+    old_content: &str,
+    new_content: &str,
+) -> Result<String, String> {
+    if old_content.is_empty() {
+        return Err("old_content must not be empty".to_string());
+    }
+    let count = file_content.matches(old_content).count();
+    if count == 0 {
+        let norm_file = file_content.replace("\r\n", "\n");
+        let norm_old = old_content.replace("\r\n", "\n");
+        let norm_count = norm_file.matches(&norm_old).count();
+        if norm_count == 1 {
+            let norm_new = new_content.replace("\r\n", "\n");
+            return Ok(norm_file.replacen(&norm_old, &norm_new, 1));
+        } else if norm_count > 1 {
+            return Err(format!(
+                "old_content matches {norm_count} locations in the file; please include more surrounding context to disambiguate"
+            ));
+        }
+        return Err(
+            "old_content was not found in the file; ensure indentation, whitespace, and line breaks match exactly"
+                .to_string(),
+        );
+    }
+    if count > 1 {
+        return Err(format!(
+            "old_content matches {count} locations in the file; please include more surrounding context to disambiguate"
+        ));
+    }
+    Ok(file_content.replacen(old_content, new_content, 1))
+}
+
+#[derive(Clone, Debug)]
+pub struct BackupEntry {
+    pub path: PathBuf,
+    pub original: Option<Vec<u8>>,
+}
+
+static BACKUP_STACK: std::sync::Mutex<Vec<BackupEntry>> = std::sync::Mutex::new(Vec::new());
+
+pub fn record_backup(path: PathBuf, original: Option<Vec<u8>>) {
+    if let Ok(mut stack) = BACKUP_STACK.lock() {
+        stack.push(BackupEntry { path, original });
+    }
+}
+
+pub fn pop_backup() -> Option<BackupEntry> {
+    BACKUP_STACK.lock().ok()?.pop()
+}
+
+pub fn backup_count() -> usize {
+    BACKUP_STACK.lock().map(|s| s.len()).unwrap_or(0)
+}
+
+pub fn undo_last_change(root: &Path) -> Result<String, String> {
+    let entry = pop_backup().ok_or_else(|| "No file changes in history to undo.".to_string())?;
+    match entry.original {
+        Some(bytes) => {
+            let current = optional_read(&entry.path, FILE_LIMIT)?;
+            atomic_write_project(root, &entry.path, &bytes, Some(current.as_deref()))?;
+            Ok(format!(
+                "Restored '{}' ({} bytes)",
+                entry.path.display(),
+                bytes.len()
+            ))
+        }
+        None => {
+            if entry.path.exists() {
+                std::fs::remove_file(&entry.path)
+                    .map_err(|e| format!("deleting created file: {e}"))?;
+            }
+            Ok(format!(
+                "Deleted newly created file '{}'",
+                entry.path.display()
+            ))
+        }
+    }
 }
 
 pub struct CommandGuard {
@@ -422,6 +507,14 @@ impl Drop for CommandGuard {
                 unsafe {
                     libc::kill(-(pid as i32), libc::SIGKILL);
                 }
+            }
+            #[cfg(windows)]
+            if let Some(pid) = self.group_id {
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/PID", &pid.to_string(), "/T", "/F"])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
             }
             let _ = child.start_kill();
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -513,5 +606,35 @@ mod tests {
         assert_eq!(std::fs::read(outside.join("file.txt")).unwrap(), b"safe");
         std::fs::remove_dir_all(root).unwrap();
         std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn apply_patch_replaces_exact_match() {
+        let file = "fn main() {\n    println!(\"hello\");\n}\n";
+        let patched = super::apply_patch(file, "    println!(\"hello\");", "    println!(\"world\");").unwrap();
+        assert_eq!(patched, "fn main() {\n    println!(\"world\");\n}\n");
+    }
+
+    #[test]
+    fn apply_patch_rejects_missing_or_ambiguous() {
+        let file = "line 1\nline 2\nline 2\nline 3\n";
+        assert!(super::apply_patch(file, "missing", "replacement").is_err());
+        assert!(super::apply_patch(file, "line 2", "replacement").is_err());
+    }
+
+    #[test]
+    fn backup_and_undo_restores_original_file() {
+        let root = temp_path("undo_root");
+        std::fs::create_dir_all(&root).unwrap();
+        let file_path = root.join("test.txt");
+        std::fs::write(&file_path, b"original content").unwrap();
+
+        super::record_backup(file_path.clone(), Some(b"original content".to_vec()));
+        std::fs::write(&file_path, b"modified content").unwrap();
+
+        let result = super::undo_last_change(&root).unwrap();
+        assert!(result.contains("Restored"));
+        assert_eq!(std::fs::read(&file_path).unwrap(), b"original content");
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
