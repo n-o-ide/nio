@@ -1879,7 +1879,7 @@ async fn interactive(options: Options) -> Result<(), String> {
         }
         if input == ":help" {
             println!(
-                "Commands: :clear, :help, :model, :mode, :approval, :reasoning, :provider, :proxy, :setting, :bash, :ai, :quit (use : or /)"
+                "Commands: :clear, :help, :model, :mode, :approval, :reasoning, :provider, :proxy, :path, :setting, :bash, :ai, :quit (use : or /)"
             );
             continue;
         }
@@ -1922,6 +1922,10 @@ async fn interactive(options: Options) -> Result<(), String> {
         }
         if !command_mode && input == ":proxy" {
             configure_proxy().await?;
+            continue;
+        }
+        if !command_mode && (input == ":path" || input == ":workingpath") {
+            print_working_path(&options)?;
             continue;
         }
         if !command_mode && input == ":clear" {
@@ -2034,7 +2038,7 @@ fn print_prompt_divider() -> Result<(), String> {
         .map_err(|error| format!("writing prompt divider: {error}"))
 }
 
-const COMMANDS: [(&str, &str); 11] = [
+const COMMANDS: [(&str, &str); 12] = [
     (":clear", "Clear conversation history"),
     (":help", "Show available commands"),
     (":model", "Switch model"),
@@ -2045,6 +2049,7 @@ const COMMANDS: [(&str, &str); 11] = [
     ),
     (":provider", "Configure model providers"),
     (":proxy", "Route provider requests through a proxy"),
+    (":path", "Show the current project directory"),
     (":reasoning", "Set reasoning effort"),
     (":bash", "Switch to a direct shell prompt"),
     (
@@ -3071,6 +3076,15 @@ async fn configure_proxy() -> Result<(), String> {
     Ok(())
 }
 
+fn print_working_path(options: &Options) -> Result<(), String> {
+    let path = options.workdir.as_deref().unwrap_or(Path::new("."));
+    let path = path
+        .canonicalize()
+        .map_err(|error| format!("resolving working directory '{}': {error}", path.display()))?;
+    println!("Working path: {}", path.display());
+    Ok(())
+}
+
 fn validate_proxy_url(input: &str) -> Result<(), String> {
     let url = reqwest::Url::parse(input)
         .map_err(|_| "enter a valid proxy URL such as http://proxy.example:8080".to_string())?;
@@ -3592,6 +3606,7 @@ Interactive commands:\n\
   :reasoning         Set reasoning effort\n\
   :provider          Add or update an OpenAI-compatible provider\n\
   :proxy             Configure a proxy for model API requests\n\
+  :path              Show the current project directory\n\
   :setting           Configure mode, reasoning, and approvals\n\
   :quit              Exit\n\
 \
