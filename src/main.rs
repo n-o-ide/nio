@@ -1,8 +1,5 @@
-use crossterm::cursor::{MoveTo, MoveToColumn, position};
-use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-    MouseButton, MouseEventKind,
-};
+use crossterm::cursor::{MoveTo, MoveToColumn};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor};
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, queue};
@@ -1405,14 +1402,7 @@ async fn generate_followup_suggestions(
 ) -> Vec<String> {
     match request_followup_suggestions(options, model, history).await {
         Ok(suggestions) => suggestions,
-        Err(_error) => {
-            emit_status(
-                options,
-                "suggestions",
-                "Model suggestions unavailable; showing general follow-ups",
-            );
-            complete_followups(Vec::new())
-        }
+        Err(_error) => Vec::new(),
     }
 }
 
@@ -1520,14 +1510,13 @@ fn complete_followups(mut suggestions: Vec<String>) -> Vec<String> {
             .collect::<Vec<_>>()
             .join(" ");
     }
-    suggestions.retain(|suggestion| !suggestion.trim().is_empty());
+    suggestions.retain(|suggestion| {
+        let lower = suggestion.to_ascii_lowercase();
+        !suggestion.trim().is_empty()
+            && !lower.starts_with("review the key files for bugs")
+            && !lower.starts_with("explain how the main components fit")
+    });
     suggestions.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
-    if suggestions.is_empty() {
-        suggestions = vec![
-            "Review the key files for bugs or missing edge cases".into(),
-            "Explain how the main components fit together".into(),
-        ];
-    }
     suggestions.truncate(3);
     suggestions
 }
@@ -1535,8 +1524,12 @@ fn complete_followups(mut suggestions: Vec<String>) -> Vec<String> {
 fn parse_followup_suggestions(content: &str) -> Vec<String> {
     let trimmed = content.trim().trim_matches('`').trim();
     let json_value = serde_json::from_str::<Value>(trimmed).ok().or_else(|| {
-        let start = trimmed.find('[')?;
-        let end = trimmed.rfind(']')?;
+        let start = trimmed.find(['[', '{'])?;
+        let end = if trimmed[start..].starts_with('[') {
+            trimmed.rfind(']')?
+        } else {
+            trimmed.rfind('}')?
+        };
         serde_json::from_str::<Value>(&trimmed[start..=end]).ok()
     });
     let from_json = json_value
@@ -1546,13 +1539,22 @@ fn parse_followup_suggestions(content: &str) -> Vec<String> {
                 value
                     .get("suggestions")
                     .or_else(|| value.get("follow_ups"))
+                    .or_else(|| value.get("followups"))
                     .and_then(Value::as_array)
             })
         })
         .map(|items| {
             items
                 .iter()
-                .filter_map(Value::as_str)
+                .filter_map(|item| {
+                    item.as_str().or_else(|| {
+                        item.get("prompt")
+                            .or_else(|| item.get("suggestion"))
+                            .or_else(|| item.get("text"))
+                            .or_else(|| item.get("title"))
+                            .and_then(Value::as_str)
+                    })
+                })
                 .map(str::trim)
                 .filter(|item| !item.is_empty())
                 .take(3)
@@ -2374,38 +2376,6 @@ struct PaletteScreen {
     active: bool,
 }
 
-struct MouseCaptureGuard {
-    enabled: bool,
-}
-
-impl MouseCaptureGuard {
-    fn disable(&mut self, stdout: &mut io::Stdout) -> Result<(), String> {
-        if self.enabled {
-            execute!(stdout, DisableMouseCapture)
-                .map_err(|error| format!("disabling mouse capture for scrollback: {error}"))?;
-            self.enabled = false;
-        }
-        Ok(())
-    }
-
-    fn enable(&mut self, stdout: &mut io::Stdout) -> Result<(), String> {
-        if !self.enabled {
-            execute!(stdout, EnableMouseCapture)
-                .map_err(|error| format!("enabling follow-up button clicks: {error}"))?;
-            self.enabled = true;
-        }
-        Ok(())
-    }
-}
-
-impl Drop for MouseCaptureGuard {
-    fn drop(&mut self) {
-        if self.enabled {
-            let _ = execute!(io::stdout(), DisableMouseCapture);
-        }
-    }
-}
-
 fn draw_followup_buttons(stdout: &mut io::Stdout, suggestions: &[String]) -> Result<(), String> {
     let width = terminal::size().map(|(width, _)| width).unwrap_or(80) as usize;
     for (index, suggestion) in suggestions.iter().enumerate() {
@@ -2507,76 +2477,29 @@ fn read_interactive_line_raw(
     suggestions: &[String],
 ) -> Result<PromptInput, String> {
     let mut stdout = io::stdout();
-    let mut mouse_capture = if suggestions.is_empty() {
-        None
-    } else {
-        execute!(stdout, EnableMouseCapture)
-            .map_err(|error| format!("enabling follow-up buttons: {error}"))?;
-        Some(MouseCaptureGuard { enabled: true })
-    };
     let mut input = String::new();
     let mut selected = 0usize;
     let mut history_cursor = None::<usize>;
     let mut history_draft = None::<String>;
     let mut palette = PaletteScreen::new();
     write!(stdout, "\r\n").map_err(|e| format!("writing prompt: {e}"))?;
-    let first_suggestion_row = if !suggestions.is_empty() {
-        write!(stdout, "Follow-ups (click to ask, or type your own):\r\n")
-            .map_err(|error| format!("drawing follow-up buttons: {error}"))?;
-        let first_row = position().map(|(_, row)| row).unwrap_or(0);
+    if !suggestions.is_empty() {
+        write!(
+            stdout,
+            "Follow-ups (type a number then Enter, or type your own):\r\n"
+        )
+        .map_err(|error| format!("drawing follow-up buttons: {error}"))?;
         draw_followup_buttons(&mut stdout, suggestions)?;
         print_prompt_divider()?;
         write!(stdout, "\r\n").map_err(|error| format!("spacing prompt divider: {error}"))?;
-        Some(first_row)
-    } else {
-        None
-    };
+    }
     draw_input(&mut stdout, prompt, &input)?;
 
     loop {
         let event = event::read().map_err(|e| format!("reading prompt input: {e}"))?;
-        if let Event::Mouse(mouse) = &event {
-            if matches!(
-                mouse.kind,
-                MouseEventKind::ScrollUp
-                    | MouseEventKind::ScrollDown
-                    | MouseEventKind::ScrollLeft
-                    | MouseEventKind::ScrollRight
-            ) {
-                if let Some(capture) = mouse_capture.as_mut() {
-                    capture.disable(&mut stdout)?;
-                }
-                continue;
-            }
-            if !palette.active
-                && mouse.kind == MouseEventKind::Down(MouseButton::Left)
-                && first_suggestion_row.is_some_and(|first_row| {
-                    mouse.row >= first_row
-                        && mouse.row < first_row.saturating_add(suggestions.len() as u16)
-                })
-            {
-                let index = (mouse.row - first_suggestion_row.unwrap_or_default()) as usize;
-                if let Some(suggestion) = suggestions.get(index) {
-                    let suggestion = suggestion.clone();
-                    palette.leave(&mut stdout)?;
-                    queue!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))
-                        .map_err(|error| format!("selecting follow-up: {error}"))?;
-                    write!(stdout, "You: {suggestion}\r\n")
-                        .map_err(|error| format!("selecting follow-up: {error}"))?;
-                    stdout
-                        .flush()
-                        .map_err(|error| format!("selecting follow-up: {error}"))?;
-                    return Ok(PromptInput::Line(suggestion));
-                }
-            }
-            continue;
-        }
         let Event::Key(key) = event else { continue };
         if key.kind == KeyEventKind::Release {
             continue;
-        }
-        if let Some(capture) = mouse_capture.as_mut() {
-            capture.enable(&mut stdout)?;
         }
 
         let command_suggestions = command_suggestions(&input);
