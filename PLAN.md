@@ -18,7 +18,7 @@
 - Provide `nio run`, `nio models`, `nio --help`, and `nio --version`.
 - On first interactive launch, require a model choice, save it as the default, then prompt for the user's first request. Allow `--model`/`NIO_MODEL` to select a model non-interactively.
 - Use OpenAI-compatible streaming chat completions with function/tool calls.
-- Allow anonymous calls only for documented free models on Kilo's public gateway.
+- Use anonymous calls only when the provider permits them.
 - Provide a small line-based interactive UI with progress updates and a persistent in-process conversation; avoid a full-screen TUI dependency in the lightweight core.
 - Let the agent list, search, and read project files automatically. Ask before writes and shell commands unless auto-approval is explicitly selected.
 - Emit NDJSON events compatible with NoIDE's existing reasoning, text, and tool-use stream parser.
@@ -26,7 +26,7 @@
 
 **Milestone:** From a project directory, a user can send a prompt to a configured model and see the streamed response in the terminal.
 
-The current implementation provides `nio`, `nio run`, `nio models`, `nio --help`, and `nio --version`. Running `nio` starts a lightweight line UI. The agent automatically gets project overview, list/search/read tools; writes and shell commands require approval by default. OpenAI-compatible model responses stream text and tool calls. `nio run --format json` emits NDJSON events (`reasoning`, `text`, and `tool_use`) that match NoIDE's current chat parser. The NoIDE UI does not yet list Nio as a selectable agent. Model listing shows free entries by default (`--all` includes paid entries), labels each model with its gateway, and supplies route-qualified selectors such as `kilo::provider/model`. First launch asks for a model and saves it in Nio's config. Kilo's public free routes support keyless use; OpenRouter is listed when its key is configured. Nio currently does not import credentials from OpenCode or provide account sign-in.
+The current implementation provides `nio`, `nio run`, `nio models`, `nio --help`, and `nio --version`. Running `nio` starts a lightweight line UI. The agent automatically gets project overview, list/search/read tools; writes and shell commands require approval by default. OpenAI-compatible model responses stream text and tool calls. `nio run --format json` emits NDJSON events (`reasoning`, `text`, and `tool_use`) that match NoIDE's current chat parser. The NoIDE UI now lists NioAI through a native subprocess adapter. Model listing includes available entries with free models first, labels each model with its gateway, and supplies route-qualified selectors such as `kilo::provider/model`. First launch asks for a model and saves it in Nio's config. Kilo's public free routes support keyless use; OpenRouter is listed when its key is configured. Nio currently does not import credentials from OpenCode or provide account sign-in.
 
 ## Version 0.2: Robustness and shell safety
 
@@ -89,3 +89,24 @@ The initial implementation uses Rust because it is available in the workspace, N
 - Confirm the package/repository namespace and check name availability.
 - Set supported minimum OS versions and release targets.
 - Version the NDJSON event schema before external integrations depend on it.
+
+## Current enhancement milestone: native NoIDE integration
+
+Implemented in the working tree:
+
+- Shared project containment/exclusion checks, symlink rejection, and bounded traversal.
+- HTTP deadlines and bounded retries before response delivery.
+- Complete-turn context trimming and explicit context/resource limits.
+- Stream completion validation before executing tools; step/call/response limits.
+- Atomic, private persistence, session locks and project/access binding, write previews and stale-write checks.
+- Unix shell group cleanup and handled noninteractive cancellation.
+- Per-run mode, reasoning, trust, text attachments, JSON model discovery and session metadata.
+- NoTerm native subprocess adapter, Chat consent and mode mapping, tools-disabled Studio, and ordered output completion.
+
+Validation scope: compilation and frontend type checking. Live provider,
+interactive terminal, cancellation, and cross-platform behavior still need
+runtime verification. No new tests are included in this milestone.
+
+Remaining release work: provider adapters, tokenizer/model-window-aware
+context budgeting, native Windows commands, checksummed release artifacts,
+automatic native installation, and published platform validation.
