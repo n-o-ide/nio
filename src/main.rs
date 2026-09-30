@@ -1,4 +1,4 @@
-use crossterm::cursor::{MoveTo, MoveToColumn};
+use crossterm::cursor::{MoveDown, MoveTo, MoveToColumn, MoveUp};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor};
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
@@ -173,20 +173,32 @@ impl Spinner {
     }
 
     fn stop(&mut self) {
+        self.stop_with_spacing(false);
+    }
+
+    fn pause(&mut self) {
         if let Some(task) = self.task.take() {
             task.abort();
             eprint!("\r\x1b[2K");
-            if let Some(started) = self.started.take() {
-                let newline = if RAW_TTY_MODE.load(Ordering::SeqCst) {
-                    "\r\n"
-                } else {
-                    "\n"
-                };
-                eprint!(
-                    "🔹 [thinking] Finished ({}s){newline}",
-                    started.elapsed().as_secs()
-                );
+            let _ = io::stderr().flush();
+        }
+    }
+
+    fn stop_with_spacing(&mut self, blank_before_finished: bool) {
+        self.pause();
+        if let Some(started) = self.started.take() {
+            let newline = if RAW_TTY_MODE.load(Ordering::SeqCst) {
+                "\r\n"
+            } else {
+                "\n"
+            };
+            if blank_before_finished {
+                eprint!("{newline}");
             }
+            eprint!(
+                "🔹 [thinking] Finished ({}s){newline}",
+                started.elapsed().as_secs()
+            );
             let _ = io::stderr().flush();
         }
     }
@@ -1686,7 +1698,7 @@ async fn run_agent_turn_inner(
     let mut retried_empty_response = false;
     loop {
         let mut retry_count = 0u32;
-        let response = loop {
+        let (response, mut spinner) = loop {
             if let Some(last_started) = last_request_started {
                 let interval = Duration::from_secs(request_interval);
                 let elapsed = last_started.elapsed();
@@ -1714,12 +1726,11 @@ async fn run_agent_turn_inner(
                 .send()
                 .await
                 .map_err(|e| format!("request failed: {e}"))?;
-            // Keep the spinner out of the streamed answer, which prints as soon
-            // as the provider starts returning content.
-            spinner.stop();
             if response.status().as_u16() != 429 {
-                break response;
+                spinner.pause();
+                break (response, spinner);
             }
+            spinner.stop();
             if retry_count >= 3 {
                 let body = response.text().await.unwrap_or_default();
                 return Err(format_provider_error(429, &body, gateway));
@@ -1743,6 +1754,7 @@ async fn run_agent_turn_inner(
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
+            spinner.stop();
             return Err(format_provider_error(status.as_u16(), &body, gateway));
         }
         let mut answer = String::new();
@@ -1833,6 +1845,8 @@ async fn run_agent_turn_inner(
                 .flush()
                 .map_err(|error| format!("finishing response line: {error}"))?;
         }
+        spinner
+            .stop_with_spacing(calls.is_empty() && response_started && !answer.trim().is_empty());
         if calls.is_empty() {
             if answer.trim().is_empty() {
                 if !retried_empty_response {
@@ -2162,10 +2176,6 @@ async fn interactive(options: Options) -> Result<(), String> {
                 println!("🔹 Cancelled. Press Ctrl+C again to exit, or Esc to exit now.");
                 continue;
             }
-            PromptInput::ModeCycle => {
-                cycle_agent_mode()?;
-                continue;
-            }
             PromptInput::Exit | PromptInput::Eof => break,
         };
         let input = line.trim();
@@ -2366,7 +2376,6 @@ const COMMANDS: [(&str, &str); 12] = [
 
 enum PromptInput {
     Line(String),
-    ModeCycle,
     Cancelled,
     Exit,
     Eof,
@@ -2482,6 +2491,7 @@ fn read_interactive_line_raw(
     let mut history_cursor = None::<usize>;
     let mut history_draft = None::<String>;
     let mut palette = PaletteScreen::new();
+    let mut mode_indicator_visible = false;
     write!(stdout, "\r\n").map_err(|e| format!("writing prompt: {e}"))?;
     if !suggestions.is_empty() {
         write!(
@@ -2538,13 +2548,35 @@ fn read_interactive_line_raw(
                 return Ok(PromptInput::Line(input));
             }
             KeyCode::Tab if input.is_empty() => {
+                cycle_agent_mode()?;
+                let config = load_user_config()?;
+                let mode = title_case(configured_agent_mode(&config));
                 palette.leave(&mut stdout)?;
-                queue!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))
+                if mode_indicator_visible {
+                    queue!(
+                        stdout,
+                        MoveUp(1),
+                        MoveToColumn(0),
+                        Clear(ClearType::CurrentLine)
+                    )
+                    .map_err(|error| format!("updating mode indicator: {error}"))?;
+                    write!(stdout, "Mode: {mode}")
+                        .map_err(|error| format!("updating mode indicator: {error}"))?;
+                    queue!(
+                        stdout,
+                        MoveDown(1),
+                        MoveToColumn(0),
+                        Clear(ClearType::CurrentLine)
+                    )
                     .map_err(|error| format!("updating prompt: {error}"))?;
-                stdout
-                    .flush()
-                    .map_err(|error| format!("updating prompt: {error}"))?;
-                return Ok(PromptInput::ModeCycle);
+                } else {
+                    queue!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))
+                        .map_err(|error| format!("updating prompt: {error}"))?;
+                    write!(stdout, "Mode: {mode}\r\n")
+                        .map_err(|error| format!("showing mode: {error}"))?;
+                    mode_indicator_visible = true;
+                }
+                draw_input(&mut stdout, prompt, &input)?;
             }
             KeyCode::Tab if !command_suggestions.is_empty() => {
                 input =
