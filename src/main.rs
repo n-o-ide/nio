@@ -1369,15 +1369,104 @@ fn confirm_tool(auto_approve: bool, action: &str) -> Result<bool, String> {
     if auto_approve {
         return Ok(true);
     }
-    eprint!("\nApprove {action}? [y/N] ");
-    io::stderr()
-        .flush()
-        .map_err(|e| format!("writing approval prompt: {e}"))?;
-    let mut answer = String::new();
-    let bytes = io::stdin()
-        .read_line(&mut answer)
-        .map_err(|e| format!("reading approval: {e}"))?;
-    Ok(bytes > 0 && matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+    loop {
+        if load_user_config()?.auto_approve_actions.unwrap_or(false) {
+            return Ok(true);
+        }
+        eprint!(
+            "\nApprove {action}? [y/N; :approval or /approval enables auto-approve; Ctrl+C exits] "
+        );
+        io::stderr()
+            .flush()
+            .map_err(|error| format!("writing approval prompt: {error}"))?;
+        let Some(answer) = read_approval_line()? else {
+            CTRL_C_COUNT.store(2, Ordering::SeqCst);
+            return Err(TURN_INTERRUPTED.into());
+        };
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "y" | "yes" => return Ok(true),
+            "" | "n" | "no" => return Ok(false),
+            command => {
+                let command = command
+                    .strip_prefix(':')
+                    .or_else(|| command.strip_prefix('/'));
+                match command {
+                    Some("approval") => toggle_auto_approval()?,
+                    Some("setting" | "settings") => configure_settings()?,
+                    Some("help") => {
+                        eprintln!("Commands: :approval (or /approval), :setting (or /setting)");
+                    }
+                    _ => eprintln!("Enter y or n, or use :approval / :setting (slash also works)."),
+                }
+            }
+        }
+    }
+}
+
+fn read_approval_line() -> Result<Option<String>, String> {
+    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+        let mut answer = String::new();
+        io::stdin()
+            .read_line(&mut answer)
+            .map_err(|error| format!("reading approval: {error}"))?;
+        return Ok(Some(answer));
+    }
+
+    terminal::enable_raw_mode().map_err(|error| format!("enabling approval input: {error}"))?;
+    RAW_TTY_MODE.store(true, Ordering::SeqCst);
+    let result = (|| {
+        let mut answer = String::new();
+        loop {
+            let event = event::read().map_err(|error| format!("reading approval: {error}"))?;
+            let Event::Key(key) = event else { continue };
+            if key.kind == KeyEventKind::Release {
+                continue;
+            }
+            match key.code {
+                KeyCode::Enter => {
+                    eprint!("\r\n");
+                    io::stderr()
+                        .flush()
+                        .map_err(|error| format!("finishing approval input: {error}"))?;
+                    return Ok(Some(answer));
+                }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    eprint!("^C\r\n");
+                    io::stderr()
+                        .flush()
+                        .map_err(|error| format!("showing approval interrupt: {error}"))?;
+                    return Ok(None);
+                }
+                KeyCode::Esc => {
+                    eprint!("\r\n");
+                    return Ok(Some(String::new()));
+                }
+                KeyCode::Backspace => {
+                    if answer.pop().is_some() {
+                        eprint!("\x08 \x08");
+                        io::stderr()
+                            .flush()
+                            .map_err(|error| format!("updating approval input: {error}"))?;
+                    }
+                }
+                KeyCode::Char(character)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    answer.push(character);
+                    eprint!("{character}");
+                    io::stderr()
+                        .flush()
+                        .map_err(|error| format!("updating approval input: {error}"))?;
+                }
+                _ => {}
+            }
+        }
+    })();
+    let restore = terminal::disable_raw_mode();
+    RAW_TTY_MODE.store(false, Ordering::SeqCst);
+    restore.map_err(|error| format!("restoring terminal input: {error}"))?;
+    result
 }
 
 async fn run_agent_turn(
@@ -1905,6 +1994,9 @@ async fn run_agent_turn_inner(
             } else {
                 execute_agent_tool(&root, &call, auto_approve_actions, interrupt).await
             };
+            if matches!(&result, Err(error) if error == TURN_INTERRUPTED) {
+                return Err(TURN_INTERRUPTED.into());
+            }
             let tool_status = if result.is_ok() { "completed" } else { "error" };
             let output = result.as_deref().unwrap_or_else(|error| error.as_str());
             emit_tool_event(options, &call, tool_status, &input, Some(output));
