@@ -3034,7 +3034,10 @@ async fn configure_proxy() -> Result<(), String> {
     println!(
         "Use a proxy you own or are authorized to use. Public proxies can expose API traffic and credentials."
     );
-    print!("HTTP(S) proxy URL, 'off' to disable the saved proxy, or Enter to keep: ");
+    println!("Proxy presets (the service must already be installed and running):");
+    println!("  1) Tinyproxy  http://127.0.0.1:8888");
+    println!("  2) Squid      http://127.0.0.1:3128");
+    print!("Choose 1/2, enter a custom URL, 'off' to disable, or Enter to keep: ");
     io::stdout()
         .flush()
         .map_err(|error| format!("writing proxy prompt: {error}"))?;
@@ -3042,7 +3045,11 @@ async fn configure_proxy() -> Result<(), String> {
     io::stdin()
         .read_line(&mut input)
         .map_err(|error| format!("reading proxy URL: {error}"))?;
-    let input = input.trim();
+    let input = match input.trim() {
+        "1" => "http://127.0.0.1:8888",
+        "2" => "http://127.0.0.1:3128",
+        value => value,
+    };
     if input.is_empty() {
         return Ok(());
     }
