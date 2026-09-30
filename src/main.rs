@@ -1,14 +1,65 @@
+use crossterm::cursor::{MoveTo, MoveToColumn, position};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEventKind,
+};
+use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor};
+use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::{execute, queue};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::env;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 
 const KILO_BASE_URL: &str = "https://api.kilo.ai/api/gateway";
 const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
+const PROVIDER_PRESETS: [(&str, &str, &str); 13] = [
+    ("openrouter", "OpenRouter", OPENROUTER_BASE_URL),
+    ("orca", "Orca", "https://orca-ai.net/v1"),
+    ("aihubmix", "AIHubMix", "https://aihubmix.com/v1"),
+    ("groq", "Groq", "https://api.groq.com/openai/v1"),
+    ("cerebras", "Cerebras", "https://api.cerebras.ai/v1"),
+    (
+        "gemini",
+        "Google Gemini",
+        "https://generativelanguage.googleapis.com/v1beta/openai",
+    ),
+    ("deepseek", "DeepSeek", "https://api.deepseek.com"),
+    ("together", "Together AI", "https://api.together.ai/v1"),
+    (
+        "fireworks",
+        "Fireworks AI",
+        "https://api.fireworks.ai/inference/v1",
+    ),
+    ("mistral", "Mistral AI", "https://api.mistral.ai/v1"),
+    (
+        "siliconflow",
+        "SiliconFlow",
+        "https://api.siliconflow.com/v1",
+    ),
+    ("claude", "Anthropic Claude", "https://api.anthropic.com/v1"),
+    ("codex", "OpenAI Codex", "https://api.openai.com/v1"),
+];
+
+fn provider_free_label(id: &str) -> Option<&'static str> {
+    match id {
+        "openrouter" | "aihubmix" => Some("free"),
+        _ => None,
+    }
+}
+
+static CTRL_C_COUNT: AtomicUsize = AtomicUsize::new(0);
+static SESSION_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
+static RAW_TTY_MODE: AtomicBool = AtomicBool::new(false);
+const TURN_INTERRUPTED: &str = "nio: turn interrupted";
 
 #[derive(Debug)]
 struct Options {
@@ -17,10 +68,10 @@ struct Options {
     model: Option<String>,
     base_url: String,
     api_key: Option<String>,
-    all_models: bool,
     json_output: bool,
     auto_approve: bool,
     workdir: Option<PathBuf>,
+    session_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -80,6 +131,181 @@ struct AssistantToolCall {
     arguments: Value,
 }
 
+struct Spinner {
+    task: Option<tokio::task::JoinHandle<()>>,
+    started: Option<Instant>,
+}
+
+impl Spinner {
+    fn start(options: &Options) -> Self {
+        Self::start_with_message(options, "Thinking")
+    }
+
+    fn start_with_message(options: &Options, message: &str) -> Self {
+        if options.json_output || !io::stderr().is_terminal() {
+            emit_status(options, "thinking", message);
+            return Self {
+                task: None,
+                started: None,
+            };
+        }
+
+        let started = Instant::now();
+        let message = message.to_string();
+        let task = tokio::spawn(async move {
+            let frames = [".", "..", "..."];
+            let mut frame = 0;
+            let mut ticker = tokio::time::interval(std::time::Duration::from_millis(500));
+            loop {
+                ticker.tick().await;
+                eprint!(
+                    "\r\x1b[2K🔹 [thinking] {}{} ({}s)",
+                    message,
+                    frames[frame],
+                    started.elapsed().as_secs()
+                );
+                let _ = io::stderr().flush();
+                frame = (frame + 1) % frames.len();
+            }
+        });
+        Self {
+            task: Some(task),
+            started: Some(started),
+        }
+    }
+
+    fn stop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+            eprint!("\r\x1b[2K");
+            if let Some(started) = self.started.take() {
+                let newline = if RAW_TTY_MODE.load(Ordering::SeqCst) {
+                    "\r\n"
+                } else {
+                    "\n"
+                };
+                eprint!(
+                    "🔹 [thinking] Finished ({}s){newline}",
+                    started.elapsed().as_secs()
+                );
+            }
+            let _ = io::stderr().flush();
+        }
+    }
+}
+
+impl Drop for Spinner {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+struct EscapeInterrupt {
+    cancelled: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    listener: Option<JoinHandle<()>>,
+    terminal_available: bool,
+}
+
+impl EscapeInterrupt {
+    fn new() -> Self {
+        let mut interrupt = Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            stop: Arc::new(AtomicBool::new(false)),
+            listener: None,
+            terminal_available: io::stdin().is_terminal() && io::stderr().is_terminal(),
+        };
+        interrupt.resume();
+        interrupt
+    }
+
+    fn resume(&mut self) {
+        if !self.terminal_available
+            || self.cancelled.load(Ordering::SeqCst)
+            || self.listener.is_some()
+        {
+            return;
+        }
+        self.stop.store(false, Ordering::SeqCst);
+        let stop = self.stop.clone();
+        let cancelled = self.cancelled.clone();
+        let listener = thread::spawn(move || {
+            if terminal::enable_raw_mode().is_err() {
+                return;
+            }
+            RAW_TTY_MODE.store(true, Ordering::SeqCst);
+            let mut previous_escape = None::<Instant>;
+            while !stop.load(Ordering::SeqCst) {
+                if !event::poll(Duration::from_millis(80)).unwrap_or(false) {
+                    continue;
+                }
+                let Ok(Event::Key(key)) = event::read() else {
+                    continue;
+                };
+                if key.kind == KeyEventKind::Release {
+                    continue;
+                }
+                match key.code {
+                    KeyCode::Esc => {
+                        let now = Instant::now();
+                        if previous_escape.is_some_and(|last| {
+                            now.duration_since(last) <= Duration::from_millis(1200)
+                        }) {
+                            cancelled.store(true, Ordering::SeqCst);
+                            eprint!("\r\n🔹 [interrupt] Stopping the current response.\r\n");
+                            let _ = io::stderr().flush();
+                            break;
+                        }
+                        previous_escape = Some(now);
+                        eprint!("\r\n🔹 [interrupt] Press Esc again to stop.\r\n");
+                        let _ = io::stderr().flush();
+                    }
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        let count = CTRL_C_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
+                        if count >= 2 {
+                            cancelled.store(true, Ordering::SeqCst);
+                            eprint!("\r\n🔹 [interrupt] Stopping Nio.\r\n");
+                            let _ = io::stderr().flush();
+                            break;
+                        }
+                        eprint!("\r\n🔹 [interrupt] Press Ctrl+C again to exit.\r\n");
+                        let _ = io::stderr().flush();
+                    }
+                    _ => {
+                        previous_escape = None;
+                    }
+                }
+            }
+            let _ = terminal::disable_raw_mode();
+            RAW_TTY_MODE.store(false, Ordering::SeqCst);
+        });
+        self.listener = Some(listener);
+    }
+
+    fn pause(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(listener) = self.listener.take() {
+            let _ = listener.join();
+        }
+    }
+
+    fn with_terminal_input<T>(
+        &mut self,
+        action: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        self.pause();
+        let result = action();
+        self.resume();
+        result
+    }
+}
+
+impl Drop for EscapeInterrupt {
+    fn drop(&mut self) {
+        self.pause();
+    }
+}
+
 #[derive(Deserialize)]
 struct ModelList {
     data: Vec<ModelInfo>,
@@ -105,13 +331,40 @@ struct ModelPricing {
 #[derive(Serialize, Deserialize, Default)]
 struct UserConfig {
     default_model: Option<String>,
+    #[serde(default)]
+    agent_mode: Option<String>,
+    #[serde(default)]
+    reasoning_effort: Option<String>,
+    #[serde(default)]
+    auto_approve_actions: Option<bool>,
+    #[serde(default)]
+    request_interval_seconds: Option<u64>,
+    #[serde(default)]
+    follow_up_suggestions: Option<bool>,
+    #[serde(default)]
+    prompt_history: Vec<String>,
+    #[serde(default)]
+    providers: Vec<ProviderConfig>,
 }
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ProviderConfig {
+    id: String,
+    name: String,
+    base_url: String,
+    #[serde(default)]
+    api_key: Option<String>,
+}
+
+const DEFAULT_REQUEST_INTERVAL_SECONDS: u64 = 2;
+const DEFAULT_AGENT_MODE: &str = "build";
 
 struct ModelChoice {
     id: String,
     name: String,
-    gateway: &'static str,
-    gateway_label: &'static str,
+    gateway: String,
+    gateway_label: String,
+    free: bool,
 }
 
 impl ModelChoice {
@@ -144,6 +397,7 @@ async fn run() -> Result<(), String> {
         }
         "interactive" => interactive(options).await,
         "models" => list_models(&options).await,
+        "provider" => configure_provider().await,
         "run" => chat(&options).await,
         command => Err(format!("unknown command '{command}'. Run 'nio --help'.")),
     }
@@ -152,24 +406,27 @@ async fn run() -> Result<(), String> {
 fn parse_args(args: Vec<String>) -> Result<Options, String> {
     let mut args = args.into_iter();
     let first = args.next();
+    let first_is_session_option = matches!(first.as_deref(), Some("-s" | "--session"));
     let command = match first.as_deref() {
         None => "interactive".to_string(),
         Some("--help") | Some("-h") | Some("help") => "help".to_string(),
-        Some("--version") | Some("-V") => {
+        Some("--version") | Some("-V") | Some("--v") | Some("-v") => {
             return Ok(Options {
                 command: "version".to_string(),
                 prompt: vec![],
                 model: None,
                 base_url: KILO_BASE_URL.to_string(),
                 api_key: None,
-                all_models: false,
                 json_output: false,
                 auto_approve: false,
                 workdir: None,
+                session_id: None,
             });
         }
         Some("run") => "run".to_string(),
         Some("models") => "models".to_string(),
+        Some("provider") => "provider".to_string(),
+        Some("-s" | "--session") => "interactive".to_string(),
         Some(prompt) => {
             let mut all = vec![prompt.to_string()];
             all.extend(args);
@@ -179,12 +436,20 @@ fn parse_args(args: Vec<String>) -> Result<Options, String> {
                 model: env::var("NIO_MODEL").ok(),
                 base_url: env::var("NIO_BASE_URL").unwrap_or_else(|_| KILO_BASE_URL.into()),
                 api_key: env::var("NIO_API_KEY").ok(),
-                all_models: false,
                 json_output: false,
                 auto_approve: false,
                 workdir: None,
+                session_id: None,
             });
         }
+    };
+    let mut args = if first_is_session_option {
+        std::iter::once(first.expect("session option was present"))
+            .chain(args)
+            .collect::<Vec<_>>()
+            .into_iter()
+    } else {
+        args
     };
 
     let mut prompt = Vec::new();
@@ -194,20 +459,33 @@ fn parse_args(args: Vec<String>) -> Result<Options, String> {
         .clone()
         .unwrap_or_else(|| KILO_BASE_URL.into());
     let mut api_key = env::var("NIO_API_KEY").ok();
-    let mut all_models = false;
     let mut json_output = false;
     let mut auto_approve = false;
     let mut workdir = None;
+    let mut session_id = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--version" | "-V" | "--v" | "-v" => {
+                return Ok(Options {
+                    command: "version".into(),
+                    prompt: vec![],
+                    model: None,
+                    base_url: KILO_BASE_URL.into(),
+                    api_key: None,
+                    json_output: false,
+                    auto_approve: false,
+                    workdir: None,
+                    session_id: None,
+                });
+            }
             "--model" | "-m" => model = Some(args.next().ok_or("--model requires a value")?),
             "--base-url" => {
                 base_url = args.next().ok_or("--base-url requires a value")?;
                 base_url_override = Some(base_url.clone());
             }
             "--api-key" => api_key = Some(args.next().ok_or("--api-key requires a value")?),
-            "--all" => all_models = true,
+            "--all" => {}
             "--format" => {
                 let format = args.next().ok_or("--format requires a value")?;
                 match format.as_str() {
@@ -223,7 +501,11 @@ fn parse_args(args: Vec<String>) -> Result<Options, String> {
                 let _ = args.next().ok_or("--variant requires a value")?;
             }
             "-s" | "--session" => {
-                let _ = args.next().ok_or("--session requires a value")?;
+                let id = args.next().ok_or("--session requires a value")?;
+                if id.is_empty() {
+                    return Err("--session must not be empty".into());
+                }
+                session_id = Some(id);
             }
             "--help" | "-h" => {
                 return Ok(Options {
@@ -232,10 +514,10 @@ fn parse_args(args: Vec<String>) -> Result<Options, String> {
                     model,
                     base_url,
                     api_key,
-                    all_models,
                     json_output,
                     auto_approve,
                     workdir,
+                    session_id,
                 });
             }
             _ if arg.starts_with('-') => return Err(format!("unknown option '{arg}'")),
@@ -253,10 +535,10 @@ fn parse_args(args: Vec<String>) -> Result<Options, String> {
         model,
         base_url,
         api_key,
-        all_models,
         json_output,
         auto_approve,
         workdir,
+        session_id,
     })
 }
 
@@ -276,17 +558,72 @@ async fn chat(options: &Options) -> Result<(), String> {
             return Err("no prompt entered".into());
         }
     }
-    run_agent_turn(options, &model, &prompt, &mut Vec::new()).await
+    let session_id = options
+        .session_id
+        .clone()
+        .or_else(|| (!options.json_output).then(generate_session_id));
+    let mut history = load_session_history(session_id.as_deref())?;
+    match run_agent_turn(options, &model, &prompt, &mut history).await {
+        Err(error) if error == TURN_INTERRUPTED => {
+            println!("\nInterrupted.");
+            Ok(())
+        }
+        Ok(suggestions) => {
+            save_session_history(session_id.as_deref(), &history)?;
+            if !options.json_output {
+                if !suggestions.is_empty() {
+                    println!("\nSuggested follow-ups:");
+                    for (index, suggestion) in suggestions.iter().enumerate() {
+                        println!("  {}) {suggestion}", index + 1);
+                    }
+                }
+                println!(
+                    "\nSession saved. Continue with: nio run -s {} -m {} \"your next prompt\"",
+                    shell_quote(session_id.as_deref().unwrap_or_default()),
+                    shell_quote(&model)
+                );
+            }
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
-fn agent_tools() -> Value {
-    json!([
+fn agent_tools(mode: &str) -> Value {
+    let tools = json!([
         {"type":"function","function":{"name":"list_files","description":"List files under a project directory.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Project-relative directory, default ."}},"additionalProperties":false}}},
         {"type":"function","function":{"name":"read_file","description":"Read a UTF-8 text file in the project.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}}},
         {"type":"function","function":{"name":"search_files","description":"Search project text files for a literal string.","parameters":{"type":"object","properties":{"query":{"type":"string"},"path":{"type":"string","description":"Optional project-relative directory, default ."}},"required":["query"],"additionalProperties":false}}},
-        {"type":"function","function":{"name":"write_file","description":"Create or replace a project file. Requires user approval.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"],"additionalProperties":false}}},
-        {"type":"function","function":{"name":"run_command","description":"Run a shell command in the project. Requires user approval.","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"],"additionalProperties":false}}}
-    ])
+        {"type":"function","function":{"name":"write_file","description":"Create or replace a project file. Approval depends on Nio settings.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"],"additionalProperties":false}}},
+        {"type":"function","function":{"name":"run_command","description":"Run a shell command in the project. Approval depends on Nio settings.","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"],"additionalProperties":false}}}
+    ]);
+    let Some(tools) = tools.as_array() else {
+        return json!([]);
+    };
+    Value::Array(
+        tools
+            .iter()
+            .filter(|tool| {
+                mode_allows_changes(mode)
+                    || tool["function"]["name"] != "write_file"
+                        && tool["function"]["name"] != "run_command"
+            })
+            .cloned()
+            .collect(),
+    )
+}
+
+fn mode_allows_changes(mode: &str) -> bool {
+    mode == "build"
+}
+
+fn configured_agent_mode(config: &UserConfig) -> &str {
+    match config.agent_mode.as_deref() {
+        Some("ask") => "ask",
+        Some("plan") => "plan",
+        Some("build") => "build",
+        _ => DEFAULT_AGENT_MODE,
+    }
 }
 
 fn project_overview(root: &Path) -> String {
@@ -368,8 +705,58 @@ fn is_ignored_path(name: &str) -> bool {
         || lower == "id_ed25519"
 }
 
-fn tool_definitions() -> Value {
-    agent_tools()
+struct MarkdownFormatter {
+    enabled: bool,
+    pending: String,
+    bold: bool,
+}
+
+impl MarkdownFormatter {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            pending: String::new(),
+            bold: false,
+        }
+    }
+
+    fn push(&mut self, text: &str) -> String {
+        if !self.enabled {
+            return text.to_string();
+        }
+        self.pending.push_str(text);
+        self.drain(false)
+    }
+
+    fn finish(&mut self) -> String {
+        if !self.enabled {
+            return std::mem::take(&mut self.pending);
+        }
+        let mut output = self.drain(true);
+        if self.bold {
+            output.push_str("\x1b[22m");
+            self.bold = false;
+        }
+        output
+    }
+
+    fn drain(&mut self, flush_partial: bool) -> String {
+        let mut output = String::new();
+        while !self.pending.is_empty() {
+            if self.pending.starts_with("**") {
+                self.pending.drain(..2);
+                self.bold = !self.bold;
+                output.push_str(if self.bold { "\x1b[1m" } else { "\x1b[22m" });
+                continue;
+            }
+            if !flush_partial && self.pending == "*" {
+                break;
+            }
+            let character = self.pending.remove(0);
+            output.push(character);
+        }
+        output
+    }
 }
 
 fn process_sse_line(
@@ -377,6 +764,8 @@ fn process_sse_line(
     options: &Options,
     answer: &mut String,
     tools: &mut std::collections::BTreeMap<usize, PendingToolCall>,
+    response_started: &mut bool,
+    formatter: &mut MarkdownFormatter,
 ) -> Result<(), String> {
     let Some(data) = line.strip_prefix("data:").map(str::trim) else {
         return Ok(());
@@ -388,8 +777,15 @@ fn process_sse_line(
         serde_json::from_str(data).map_err(|e| format!("invalid model stream event: {e}"))?;
     for choice in chunk.choices {
         if let Some(content) = choice.delta.content {
+            if !content.is_empty() && !*response_started {
+                emit_assistant_start(options)?;
+                *response_started = true;
+            }
             answer.push_str(&content);
-            emit_text(options, &content)?;
+            let formatted = formatter.push(&content);
+            if !formatted.is_empty() {
+                emit_text(options, &formatted)?;
+            }
         }
         for partial in choice.delta.tool_calls {
             let call = tools.entry(partial.index).or_default();
@@ -403,6 +799,21 @@ fn process_sse_line(
     Ok(())
 }
 
+fn emit_assistant_start(options: &Options) -> Result<(), String> {
+    if !options.json_output {
+        let newline = if RAW_TTY_MODE.load(Ordering::SeqCst) {
+            "\r\n"
+        } else {
+            "\n"
+        };
+        print!("{newline}🔹 🤖 nio:{newline}  ");
+        io::stdout()
+            .flush()
+            .map_err(|e| format!("writing response label: {e}"))?;
+    }
+    Ok(())
+}
+
 fn emit_status(options: &Options, status: &str, message: &str) {
     if options.json_output {
         // NoIDE understands this OpenCode/Kilo-compatible reasoning event.
@@ -410,7 +821,12 @@ fn emit_status(options: &Options, status: &str, message: &str) {
             &json!({"type":"reasoning","part":{"type":"reasoning","text":format!("{status}: {message}")}}),
         );
     } else {
-        eprintln!("[{status}] {message}");
+        let newline = if RAW_TTY_MODE.load(Ordering::SeqCst) {
+            "\r\n"
+        } else {
+            "\n"
+        };
+        eprint!("🔹 [{status}] {message}{newline}");
     }
 }
 
@@ -418,8 +834,17 @@ fn emit_text(options: &Options, text: &str) -> Result<(), String> {
     if options.json_output {
         emit_json(&json!({"type":"text","part":{"type":"text","text":text}}));
     } else {
-        print!("{text}");
-        io::stdout()
+        let mut stdout = io::stdout().lock();
+        if RAW_TTY_MODE.load(Ordering::SeqCst) {
+            stdout
+                .write_all(&indent_response_lines(text, "\r\n"))
+                .map_err(|e| format!("writing response: {e}"))?;
+        } else {
+            stdout
+                .write_all(&indent_response_lines(text, "\n"))
+                .map_err(|e| format!("writing response: {e}"))?;
+        }
+        stdout
             .flush()
             .map_err(|e| format!("writing response: {e}"))?;
     }
@@ -427,7 +852,33 @@ fn emit_text(options: &Options, text: &str) -> Result<(), String> {
 }
 
 fn emit_json(value: &Value) {
-    println!("{value}");
+    let newline = if RAW_TTY_MODE.load(Ordering::SeqCst) {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    print!("{value}{newline}");
+}
+
+fn indent_response_lines(text: &str, newline: &str) -> Vec<u8> {
+    let mut output =
+        Vec::with_capacity(text.len() + text.matches('\n').count() * (newline.len() + 2));
+    let mut previous_was_cr = false;
+    for byte in text.bytes() {
+        if byte == b'\n' && !previous_was_cr {
+            output.extend_from_slice(newline.as_bytes());
+            output.extend_from_slice(b"  ");
+            previous_was_cr = false;
+            continue;
+        } else if byte == b'\n' {
+            output.extend_from_slice(b"  ");
+            previous_was_cr = false;
+            continue;
+        }
+        output.push(byte);
+        previous_was_cr = byte == b'\r';
+    }
+    output
 }
 
 fn emit_tool_event(
@@ -460,6 +911,7 @@ async fn execute_agent_tool(
     root: &Path,
     call: &AssistantToolCall,
     auto_approve: bool,
+    interrupt: &mut EscapeInterrupt,
 ) -> Result<String, String> {
     let args = &call.arguments;
     match call.name.as_str() {
@@ -543,10 +995,12 @@ async fn execute_agent_tool(
             if is_excluded_project_path(root, &path) {
                 return Err("file is excluded from automatic project access".into());
             }
-            if !confirm_tool(
-                auto_approve,
-                &format!("Write {} ({} bytes)", path.display(), content.len()),
-            )? {
+            if !interrupt.with_terminal_input(|| {
+                confirm_tool(
+                    auto_approve,
+                    &format!("Write {} ({} bytes)", path.display(), content.len()),
+                )
+            })? {
                 return Err("user denied file write".into());
             }
             std::fs::write(&path, content).map_err(|e| format!("writing file: {e}"))?;
@@ -558,7 +1012,9 @@ async fn execute_agent_tool(
         }
         "run_command" => {
             let command = required_arg(args, "command")?;
-            if !confirm_tool(auto_approve, &format!("Run command: {command}"))? {
+            if !interrupt.with_terminal_input(|| {
+                confirm_tool(auto_approve, &format!("Run command: {command}"))
+            })? {
                 return Err("user denied command".into());
             }
             let mut child = tokio::process::Command::new("sh")
@@ -685,29 +1141,228 @@ async fn run_agent_turn(
     model: &str,
     prompt: &str,
     history: &mut Vec<Value>,
+) -> Result<Vec<String>, String> {
+    let mut interrupt = EscapeInterrupt::new();
+    let cancelled = interrupt.cancelled.clone();
+    let result = tokio::select! {
+        result = async {
+            run_agent_turn_inner(options, model, prompt, history, &mut interrupt).await?;
+            if options.json_output
+                || !load_user_config()?
+                    .follow_up_suggestions
+                    .unwrap_or(true)
+            {
+                Ok(Vec::new())
+            } else {
+                Ok(generate_followup_suggestions(options, model, history).await)
+            }
+        } => result,
+        _ = wait_for_interrupt(cancelled) => Err(TURN_INTERRUPTED.into()),
+    };
+    interrupt.pause();
+    result
+}
+
+async fn generate_followup_suggestions(
+    options: &Options,
+    model: &str,
+    history: &[Value],
+) -> Vec<String> {
+    match request_followup_suggestions(options, model, history).await {
+        Ok(suggestions) => suggestions,
+        Err(_error) => {
+            emit_status(
+                options,
+                "suggestions",
+                "Model suggestions unavailable; showing general follow-ups",
+            );
+            complete_followups(Vec::new())
+        }
+    }
+}
+
+async fn request_followup_suggestions(
+    options: &Options,
+    model: &str,
+    history: &[Value],
+) -> Result<Vec<String>, String> {
+    let (gateway, model_id) = split_model_selector(model)?;
+    let (base_url, key) = resolve_model_provider(options, gateway, model_id)?;
+
+    let mut context = history
+        .iter()
+        .rev()
+        .filter_map(|message| {
+            let role = message.get("role")?.as_str()?;
+            let content = message.get("content")?.as_str()?;
+            matches!(role, "user" | "assistant").then(|| json!({"role":role,"content":content}))
+        })
+        .take(8)
+        .collect::<Vec<_>>();
+    context.reverse();
+    let mut messages = vec![json!({
+        "role":"system",
+        "content":"Suggest up to three concise, useful follow-up prompts the user could choose next, based on this conversation. Return one prompt per line, each beginning with '- '. Make the prompts specific, distinct, and each under 100 characters. Do not add a heading or explanation."
+    })];
+    messages.extend(context);
+
+    let _spinner = Spinner::start_with_message(options, "Preparing follow-up suggestions");
+    let delay = load_user_config()?
+        .request_interval_seconds
+        .unwrap_or(DEFAULT_REQUEST_INTERVAL_SECONDS);
+    if delay > 0 {
+        tokio::time::sleep(Duration::from_secs(delay)).await;
+    }
+
+    let client = reqwest::Client::new();
+    let url = endpoint(&base_url, "chat/completions");
+    let mut retry_count = 0;
+    let response = loop {
+        let mut body = json!({
+            "model":model_id,
+            "messages":messages,
+            "stream":false,
+            "max_tokens":256
+        });
+        if let Some(effort) = load_user_config()?.reasoning_effort {
+            body["reasoning_effort"] = json!(effort);
+        }
+        let mut request = client.post(&url).json(&body);
+        if let Some(key) = key.as_deref() {
+            request = request.bearer_auth(key);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| format!("request failed: {error}"))?;
+        if response.status().as_u16() != 429 {
+            break response;
+        }
+        if retry_count >= 3 {
+            let body = response.text().await.unwrap_or_default();
+            return Err(format_provider_error(429, &body, gateway));
+        }
+        let Some(delay) = rate_limit_retry_delay(response.headers(), retry_count) else {
+            let body = response.text().await.unwrap_or_default();
+            return Err(format_provider_error(429, &body, gateway));
+        };
+        emit_status(
+            options,
+            "retrying",
+            &format!(
+                "Provider rate limit reached; retrying in {}s",
+                delay.as_secs()
+            ),
+        );
+        tokio::time::sleep(delay).await;
+        retry_count += 1;
+    };
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format_provider_error(status.as_u16(), &body, gateway));
+    }
+    let body = response
+        .json::<Value>()
+        .await
+        .map_err(|error| format!("invalid suggestions response: {error}"))?;
+    let content = body
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+        .ok_or("model returned no suggestions")?;
+    let mut suggestions = content
+        .find('{')
+        .zip(content.rfind('}'))
+        .and_then(|(start, end)| serde_json::from_str::<Value>(&content[start..=end]).ok())
+        .and_then(|value| value.get("suggestions")?.as_array().cloned())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|suggestion| !suggestion.is_empty())
+                .take(3)
+                .map(|suggestion| truncate(suggestion, 100))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if suggestions.len() != 3 {
+        suggestions = parse_followup_lines(content);
+    }
+    Ok(complete_followups(suggestions))
+}
+
+fn complete_followups(mut suggestions: Vec<String>) -> Vec<String> {
+    for suggestion in &mut suggestions {
+        *suggestion = suggestion
+            .replace("**", "")
+            .replace("__", "")
+            .replace('`', "")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+    }
+    suggestions.retain(|suggestion| !suggestion.trim().is_empty());
+    suggestions.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    if suggestions.is_empty() {
+        suggestions = vec![
+            "Review the key files for bugs or missing edge cases".into(),
+            "Explain how the main components fit together".into(),
+        ];
+    }
+    suggestions.truncate(3);
+    suggestions
+}
+
+fn parse_followup_lines(content: &str) -> Vec<String> {
+    content
+        .lines()
+        .filter_map(|line| {
+            let mut line = line.trim().trim_matches('`').trim();
+            if line.starts_with('{') || line.starts_with('}') {
+                return None;
+            }
+            let mut has_list_marker = false;
+            for prefix in ["- ", "* ", "• "] {
+                if let Some(item) = line.strip_prefix(prefix) {
+                    line = item.trim();
+                    has_list_marker = true;
+                    break;
+                }
+            }
+            let number_end = line
+                .find(['.', ')'])
+                .filter(|end| *end > 0 && line[..*end].chars().all(|ch| ch.is_ascii_digit()));
+            if let Some(end) = number_end {
+                line = line[end + 1..].trim();
+                has_list_marker = true;
+            }
+            if !has_list_marker {
+                return None;
+            }
+            let line = line.trim_matches(|ch: char| matches!(ch, '`' | '*' | '"' | '\''));
+            (!line.is_empty()).then(|| truncate(line, 100))
+        })
+        .take(3)
+        .collect()
+}
+
+async fn wait_for_interrupt(cancelled: Arc<AtomicBool>) {
+    while !cancelled.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+}
+
+async fn run_agent_turn_inner(
+    options: &Options,
+    model: &str,
+    prompt: &str,
+    history: &mut Vec<Value>,
+    interrupt: &mut EscapeInterrupt,
 ) -> Result<(), String> {
     let (gateway, model_id) = split_model_selector(model)?;
-    let base_url = match gateway {
-        Some("kilo") => KILO_BASE_URL,
-        Some("openrouter") => OPENROUTER_BASE_URL,
-        Some(other) => return Err(format!("unknown model gateway '{other}'")),
-        None if model_id.starts_with("kilo-auto/") => KILO_BASE_URL,
-        None => options.base_url.as_str(),
-    };
-    let key = match gateway {
-        Some(provider) => model_api_key(options, provider),
-        None if base_url == KILO_BASE_URL => model_api_key(options, "kilo"),
-        None => options.api_key.clone(),
-    };
+    let (base_url, key) = resolve_model_provider(options, gateway, model_id)?;
     let client = reqwest::Client::new();
-    if key.is_none() && !supports_anonymous_gateway(base_url) {
-        let hint = match gateway {
-            Some("kilo") => "this endpoint requires an API key; set KILO_API_KEY or NIO_API_KEY",
-            Some("openrouter") => "set OPENROUTER_API_KEY or NIO_API_KEY to use OpenRouter models",
-            _ => "this endpoint requires an API key; set NIO_API_KEY",
-        };
-        return Err(hint.into());
-    }
 
     let root = options.workdir.as_deref().unwrap_or(Path::new("."));
     let root = root
@@ -720,9 +1375,25 @@ async fn run_agent_turn(
         ));
     }
     emit_status(options, "exploring", "Scanning project files");
+    let user_config = load_user_config()?;
+    let mode = configured_agent_mode(&user_config);
+    let auto_approve_actions =
+        options.auto_approve || user_config.auto_approve_actions.unwrap_or(false);
+    let mode_instructions = match mode {
+        "ask" => {
+            "Mode: Ask. Answer questions and clarify requests. You may inspect project files for context, but never make changes or run commands."
+        }
+        "plan" => {
+            "Mode: Plan. Inspect the project as needed and return a clear implementation plan. Do not change files or run commands."
+        }
+        _ => {
+            "Mode: Build. Carry out the user's requested work. Inspect first, then make changes and run commands when appropriate. Ask before writing files or executing shell commands unless auto-approval was explicitly enabled."
+        }
+    };
     let system = format!(
-        "You are NioAI, a coding agent working in the project at {}. You can inspect, search, and change project files with the provided tools. Start by inspecting the relevant files; do not claim you cannot access the project. Read and search tools are automatic. Before writing files or executing shell commands, call the tool: Nio will ask the user for approval unless auto-approval was explicitly enabled. Stay within the project directory. Be concise and report what you changed.",
-        root.display()
+        "You are NioAI, a coding agent working in the project at {}. Start by inspecting relevant files when needed; do not claim you cannot access the project. Read and search tools are automatic. Stay within the project directory. Be concise. {}",
+        root.display(),
+        mode_instructions
     );
     let overview = project_overview(&root);
     let mut messages = vec![
@@ -736,34 +1407,80 @@ async fn run_agent_turn(
     messages.push(user_message.clone());
     history.push(user_message);
 
-    let url = endpoint(base_url, "chat/completions");
-    for _ in 0..8 {
-        emit_status(options, "thinking", "Thinking");
-        let mut request = client.post(&url).json(&json!({
-            "model": model_id,
-            "messages": messages.clone(),
-            "tools": tool_definitions(),
-            "tool_choice": "auto",
-            "stream": true
-        }));
-        if let Some(key) = key.as_deref() {
-            request = request.bearer_auth(key);
-        }
-        let response = request
-            .send()
-            .await
-            .map_err(|e| format!("request failed: {e}"))?;
+    let url = endpoint(&base_url, "chat/completions");
+    let request_interval = load_user_config()?
+        .request_interval_seconds
+        .unwrap_or(DEFAULT_REQUEST_INTERVAL_SECONDS);
+    let mut last_request_started = None::<Instant>;
+    let reasoning_effort = user_config.reasoning_effort.as_deref();
+    let tools = agent_tools(mode);
+    loop {
+        let mut retry_count = 0u32;
+        let response = loop {
+            if let Some(last_started) = last_request_started {
+                let interval = Duration::from_secs(request_interval);
+                let elapsed = last_started.elapsed();
+                if elapsed < interval {
+                    tokio::time::sleep(interval - elapsed).await;
+                }
+            }
+            last_request_started = Some(Instant::now());
+            let mut spinner = Spinner::start(options);
+            let mut body = json!({
+                "model": model_id,
+                "messages": messages.clone(),
+                "tools": tools.clone(),
+                "tool_choice": "auto",
+                "stream": true
+            });
+            if let Some(effort) = reasoning_effort {
+                body["reasoning_effort"] = json!(effort);
+            }
+            let mut request = client.post(&url).json(&body);
+            if let Some(key) = key.as_deref() {
+                request = request.bearer_auth(key);
+            }
+            let response = request
+                .send()
+                .await
+                .map_err(|e| format!("request failed: {e}"))?;
+            // Keep the spinner out of the streamed answer, which prints as soon
+            // as the provider starts returning content.
+            spinner.stop();
+            if response.status().as_u16() != 429 {
+                break response;
+            }
+            if retry_count >= 3 {
+                let body = response.text().await.unwrap_or_default();
+                return Err(format_provider_error(429, &body, gateway));
+            }
+            let Some(delay) = rate_limit_retry_delay(response.headers(), retry_count) else {
+                let body = response.text().await.unwrap_or_default();
+                return Err(format_provider_error(429, &body, gateway));
+            };
+            emit_status(
+                options,
+                "retrying",
+                &format!(
+                    "Provider rate limit reached; retrying in {}s ({}/3)",
+                    delay.as_secs(),
+                    retry_count + 1
+                ),
+            );
+            tokio::time::sleep(delay).await;
+            retry_count += 1;
+        };
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(format!(
-                "provider returned {status}: {}",
-                truncate(&body, 1200)
-            ));
+            return Err(format_provider_error(status.as_u16(), &body, gateway));
         }
         let mut stream = response.bytes_stream();
         let mut buffer = Vec::new();
         let mut answer = String::new();
+        let mut response_started = false;
+        let mut formatter =
+            MarkdownFormatter::new(!options.json_output && io::stdout().is_terminal());
         let mut pending_tools = std::collections::BTreeMap::<usize, PendingToolCall>::new();
         while let Some(part) = stream.next().await {
             let bytes = part.map_err(|e| format!("response stream failed: {e}"))?;
@@ -773,14 +1490,32 @@ async fn run_agent_turn(
                     .trim_end_matches('\r')
                     .to_string();
                 buffer.drain(..=pos);
-                process_sse_line(&line, options, &mut answer, &mut pending_tools)?;
+                process_sse_line(
+                    &line,
+                    options,
+                    &mut answer,
+                    &mut pending_tools,
+                    &mut response_started,
+                    &mut formatter,
+                )?;
             }
         }
         if !buffer.is_empty() {
             let line = String::from_utf8_lossy(&buffer)
                 .trim_end_matches('\r')
                 .to_string();
-            process_sse_line(&line, options, &mut answer, &mut pending_tools)?;
+            process_sse_line(
+                &line,
+                options,
+                &mut answer,
+                &mut pending_tools,
+                &mut response_started,
+                &mut formatter,
+            )?;
+        }
+        let formatted_tail = formatter.finish();
+        if !formatted_tail.is_empty() {
+            emit_text(options, &formatted_tail)?;
         }
         let calls = pending_tools
             .into_values()
@@ -794,12 +1529,27 @@ async fn run_agent_turn(
                 }
             })
             .collect::<Vec<_>>();
-        if calls.is_empty() {
-            emit_status(options, "working", "Finishing response");
-            if options.json_output {
-                emit_json(&json!({"type":"step_finish"}));
+        if !options.json_output && response_started && !answer.ends_with('\n') {
+            let newline = if RAW_TTY_MODE.load(Ordering::SeqCst) {
+                "\r\n"
             } else {
-                println!();
+                "\n"
+            };
+            print!("{newline}");
+            io::stdout()
+                .flush()
+                .map_err(|error| format!("finishing response line: {error}"))?;
+        }
+        if calls.is_empty() {
+            if answer.trim().is_empty() {
+                return Err(
+                    "the model returned an empty response; try again or switch models with :model"
+                        .into(),
+                );
+            }
+            if options.json_output {
+                emit_status(options, "working", "Finishing response");
+                emit_json(&json!({"type":"step_finish"}));
             }
             let assistant = json!({"role":"assistant", "content":answer});
             history.push(assistant);
@@ -828,7 +1578,16 @@ async fn run_agent_turn(
             };
             emit_status(options, status, &tool_label);
             emit_tool_event(options, &call, "running", &input, None);
-            let result = execute_agent_tool(&root, &call, options.auto_approve).await;
+            let result = if !mode_allows_changes(mode)
+                && matches!(call.name.as_str(), "write_file" | "run_command")
+            {
+                Err(format!(
+                    "{} mode does not allow project changes or commands",
+                    mode
+                ))
+            } else {
+                execute_agent_tool(&root, &call, auto_approve_actions, interrupt).await
+            };
             let tool_status = if result.is_ok() { "completed" } else { "error" };
             let output = result.as_deref().unwrap_or_else(|error| error.as_str());
             emit_tool_event(options, &call, tool_status, &input, Some(output));
@@ -842,44 +1601,129 @@ async fn run_agent_turn(
             history.push(tool_message);
         }
     }
-    Err("stopped after 8 tool rounds; please narrow the request".into())
 }
 
 async fn list_models(options: &Options) -> Result<(), String> {
-    let choices = fetch_model_choices(options, options.all_models).await?;
-    for choice in choices {
-        println!(
-            "{} ({})\t{}",
-            choice.name,
-            choice.gateway_label,
-            choice.selector()
-        );
+    let choices = fetch_model_choices(options).await?;
+    if choices.is_empty() {
+        println!("No models found.");
+        return Ok(());
     }
+    println!("Models · free first · {} available", choices.len());
+    let terminal_width = terminal::size()
+        .map(|(width, _)| width as usize)
+        .unwrap_or(110)
+        .clamp(64, 160);
+    let model_width = choices
+        .iter()
+        .map(|choice| choice.name.chars().count())
+        .max()
+        .unwrap_or(5)
+        .clamp(12, 36);
+    let provider_width = choices
+        .iter()
+        .map(|choice| choice.gateway_label.chars().count())
+        .max()
+        .unwrap_or(8)
+        .clamp(8, 18);
+    let selector_width = terminal_width
+        .saturating_sub(16 + model_width + provider_width)
+        .max(12);
+    let number_rule = "─".repeat(5);
+    let model_rule = "─".repeat(model_width + 2);
+    let provider_rule = "─".repeat(provider_width + 2);
+    let selector_rule = "─".repeat(selector_width + 2);
+    println!("┌{number_rule}┬{model_rule}┬{provider_rule}┬{selector_rule}┐");
+    println!(
+        "│ {:^3} │ {:<model_width$} │ {:<provider_width$} │ {:<selector_width$} │",
+        "#", "MODEL", "PROVIDER", "SELECTOR"
+    );
+    println!("├{number_rule}┼{model_rule}┼{provider_rule}┼{selector_rule}┤");
+    for (index, choice) in choices.iter().enumerate() {
+        let name = truncate(&choice.name, model_width.saturating_sub(1));
+        let selector = choice.selector();
+        let chunks = selector
+            .chars()
+            .collect::<Vec<_>>()
+            .chunks(selector_width)
+            .map(|chunk| chunk.iter().collect::<String>())
+            .collect::<Vec<_>>();
+        for (line_index, chunk) in chunks.iter().enumerate() {
+            if line_index == 0 {
+                println!(
+                    "│ {:>3} │ {:<model_width$} │ {:<provider_width$} │ {:<selector_width$} │",
+                    index + 1,
+                    name,
+                    truncate(&choice.gateway_label, provider_width.saturating_sub(1)),
+                    chunk
+                );
+            } else {
+                println!(
+                    "│     │ {:<model_width$} │ {:<provider_width$} │ {:<selector_width$} │",
+                    "", "", chunk
+                );
+            }
+        }
+    }
+    println!("└{number_rule}┴{model_rule}┴{provider_rule}┴{selector_rule}┘");
+    println!("\nRun a model with: nio run -m <SELECTOR> <prompt>");
     Ok(())
 }
 
-async fn fetch_model_choices(
-    options: &Options,
-    include_paid: bool,
-) -> Result<Vec<ModelChoice>, String> {
+async fn fetch_model_choices(options: &Options) -> Result<Vec<ModelChoice>, String> {
     let client = reqwest::Client::new();
-    let kilo_key = model_api_key(options, "kilo");
-    let kilo = fetch_models(&client, KILO_BASE_URL, kilo_key.as_deref()).await?;
-    let mut choices = choices_from_catalog(kilo.data, "kilo", "Kilo Gateway", include_paid);
-
-    if let Some(openrouter_key) = env::var("OPENROUTER_API_KEY")
-        .ok()
-        .or_else(|| options.api_key.clone())
-    {
-        let openrouter = fetch_models(&client, OPENROUTER_BASE_URL, Some(&openrouter_key)).await?;
-        choices.extend(choices_from_catalog(
-            openrouter.data,
-            "openrouter",
-            "OpenRouter",
-            include_paid,
-        ));
+    let mut choices = Vec::new();
+    let mut errors = Vec::new();
+    let mut providers = vec![ProviderConfig {
+        id: "kilo".into(),
+        name: "Kilo Gateway".into(),
+        base_url: KILO_BASE_URL.into(),
+        api_key: model_api_key(options, "kilo"),
+    }];
+    let config = load_user_config()?;
+    if let Some(openrouter) = config.providers.iter().find(|p| p.id == "openrouter") {
+        providers.push(openrouter.clone());
+    } else if let Some(key) = model_api_key(options, "openrouter") {
+        providers.push(ProviderConfig {
+            id: "openrouter".into(),
+            name: "OpenRouter".into(),
+            base_url: OPENROUTER_BASE_URL.into(),
+            api_key: Some(key),
+        });
     }
-    choices.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    providers.extend(
+        config
+            .providers
+            .into_iter()
+            .filter(|p| p.id != "openrouter" && p.id != "kilo"),
+    );
+    for provider in providers {
+        let key = model_api_key(options, &provider.id).or(provider.api_key.clone());
+        match fetch_models(&client, &provider.base_url, key.as_deref()).await {
+            Ok(catalog) => choices.extend(choices_from_catalog(
+                catalog.data,
+                &provider.id,
+                &provider.name,
+            )),
+            Err(error) => errors.push(format!("{}: {error}", provider.name)),
+        }
+    }
+    if choices.is_empty() && !errors.is_empty() {
+        return Err(errors.join("\n"));
+    }
+    for error in errors {
+        eprintln!("nio: skipped provider model catalog: {error}");
+    }
+    choices.sort_by(|a, b| {
+        b.free
+            .cmp(&a.free)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            .then_with(|| {
+                a.gateway_label
+                    .to_lowercase()
+                    .cmp(&b.gateway_label.to_lowercase())
+            })
+    });
     Ok(choices)
 }
 
@@ -910,56 +1754,99 @@ async fn fetch_models(
         .map_err(|e| format!("invalid model catalog at {base_url}: {e}"))
 }
 
-fn choices_from_catalog(
-    models: Vec<ModelInfo>,
-    gateway: &'static str,
-    label: &'static str,
-    include_paid: bool,
-) -> Vec<ModelChoice> {
+fn choices_from_catalog(models: Vec<ModelInfo>, gateway: &str, label: &str) -> Vec<ModelChoice> {
     let mut choices = Vec::new();
     let mut has_kilo_auto_free = false;
     for model in models {
         has_kilo_auto_free |= gateway == "kilo" && model.id == "kilo-auto/free";
-        if include_paid || model.is_free() {
-            choices.push(ModelChoice {
-                name: model.name.unwrap_or_else(|| model.id.clone()),
-                id: model.id,
-                gateway,
-                gateway_label: label,
-            });
-        }
+        let free = model.is_free();
+        choices.push(ModelChoice {
+            name: model.name.unwrap_or_else(|| model.id.clone()),
+            id: model.id,
+            gateway: gateway.to_string(),
+            gateway_label: label.to_string(),
+            free,
+        });
     }
-    if gateway == "kilo" && !include_paid && !has_kilo_auto_free {
+    if gateway == "kilo" && !has_kilo_auto_free {
         choices.push(ModelChoice {
             id: "kilo-auto/free".into(),
             name: "Kilo Auto Free".into(),
-            gateway,
-            gateway_label: label,
+            gateway: gateway.to_string(),
+            gateway_label: label.to_string(),
+            free: true,
         });
     }
     choices
 }
 
 async fn interactive(options: Options) -> Result<(), String> {
-    let model = chosen_model(&options).await?;
-    let mut history = Vec::new();
-    println!("NioAI · model {model}");
-    println!("Project tools are available automatically. Type :help for commands.");
+    ctrlc::set_handler(|| {
+        CTRL_C_COUNT.fetch_add(1, Ordering::SeqCst);
+    })
+    .map_err(|e| format!("setting Ctrl+C behavior: {e}"))?;
+    let session_id = options
+        .session_id
+        .clone()
+        .unwrap_or_else(generate_session_id);
+    let mut model = chosen_model(&options).await?;
+    let mut history = load_session_history(Some(&session_id))?;
+    let mut prompt_history = load_user_config()?.prompt_history;
+    if prompt_history.len() > 100 {
+        prompt_history.drain(..prompt_history.len() - 100);
+    }
+    print_session_header(&model, &session_id)?;
+    println!("Project tools are available automatically.");
+    println!("Type : or / for commands; :help for help.");
+    print_prompt_divider()?;
 
+    let mut visible_followups = Vec::<String>::new();
+    let mut command_mode = false;
     loop {
-        print!("\nnio> ");
-        io::stdout()
-            .flush()
-            .map_err(|e| format!("writing prompt: {e}"))?;
-        let mut line = String::new();
-        if io::stdin()
-            .read_line(&mut line)
-            .map_err(|e| format!("reading prompt: {e}"))?
-            == 0
-        {
+        if CTRL_C_COUNT.load(Ordering::SeqCst) >= 2 {
             break;
         }
+        let prompt = if command_mode { "$ " } else { "🤖 nio> " };
+        let line = match read_interactive_line(prompt, &prompt_history, &visible_followups)? {
+            PromptInput::Line(line) => {
+                CTRL_C_COUNT.store(0, Ordering::SeqCst);
+                let entry = line.trim();
+                if !entry.is_empty() && prompt_history.last().map(String::as_str) != Some(entry) {
+                    prompt_history.push(entry.to_string());
+                    if prompt_history.len() > 100 {
+                        prompt_history.remove(0);
+                    }
+                    if let Err(error) = save_prompt_history(&prompt_history) {
+                        eprintln!("nio: could not save prompt history: {error}");
+                    }
+                }
+                if !entry.is_empty() {
+                    visible_followups.clear();
+                }
+                line
+            }
+            PromptInput::Cancelled => {
+                let count = CTRL_C_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
+                if count >= 2 {
+                    break;
+                }
+                println!("🔹 Cancelled. Press Ctrl+C again to exit, or Esc to exit now.");
+                continue;
+            }
+            PromptInput::ModeCycle => {
+                cycle_agent_mode()?;
+                continue;
+            }
+            PromptInput::Exit | PromptInput::Eof => break,
+        };
         let input = line.trim();
+        let normalized_input;
+        let input = if !command_mode && let Some(command) = input.strip_prefix('/') {
+            normalized_input = format!(":{command}");
+            normalized_input.as_str()
+        } else {
+            input
+        };
         if input.is_empty() {
             continue;
         }
@@ -967,21 +1854,565 @@ async fn interactive(options: Options) -> Result<(), String> {
             break;
         }
         if input == ":help" {
-            println!("Commands: :clear (clear conversation), :quit");
+            println!(
+                "Commands: :clear, :help, :model, :mode, :approval, :reasoning, :provider, :setting, :bash, :ai, :quit (use : or /)"
+            );
             continue;
         }
-        if input == ":clear" {
+        if input == ":bash" || input == ":command" {
+            command_mode = true;
+            visible_followups.clear();
+            println!("Command prompt enabled. Type :ai to return to Nio.");
+            continue;
+        }
+        if input == ":ai" {
+            command_mode = false;
+            visible_followups.clear();
+            println!("Returned to the Nio prompt.");
+            continue;
+        }
+        if !command_mode && input == ":model" {
+            if let Some(selected) = select_and_save_model(&options).await? {
+                model = selected;
+                println!("Switched to model {model}");
+            } else {
+                println!("Model unchanged.");
+            }
+            continue;
+        }
+        if !command_mode && input == ":mode" {
+            configure_agent_mode()?;
+            continue;
+        }
+        if !command_mode && input == ":approval" {
+            toggle_auto_approval()?;
+            continue;
+        }
+        if !command_mode && input == ":reasoning" {
+            configure_reasoning_effort()?;
+            continue;
+        }
+        if !command_mode && input == ":provider" {
+            configure_provider().await?;
+            continue;
+        }
+        if !command_mode && input == ":clear" {
             history.clear();
-            println!("Cleared conversation history.");
+            visible_followups.clear();
+            save_session_history(Some(&session_id), &history)?;
+            let mut stdout = io::stdout();
+            execute!(
+                stdout,
+                Clear(ClearType::Purge),
+                Clear(ClearType::All),
+                MoveTo(0, 0)
+            )
+            .map_err(|error| format!("clearing terminal: {error}"))?;
+            print_session_header(&model, &session_id)?;
+            println!("Conversation history cleared.");
+            print_prompt_divider()?;
             continue;
         }
-        if input.starts_with(':') {
+        if !command_mode && (input == ":setting" || input == ":settings") {
+            configure_settings()?;
+            continue;
+        }
+        if !command_mode && input.starts_with(':') {
             eprintln!("Unknown command. Type :help for commands.");
             continue;
         }
-        run_agent_turn(&options, &model, input, &mut history).await?;
+        if command_mode {
+            let status = tokio::process::Command::new("sh")
+                .arg("-lc")
+                .arg(input)
+                .current_dir(options.workdir.as_deref().unwrap_or(Path::new(".")))
+                .status()
+                .await
+                .map_err(|error| format!("starting command: {error}"))?;
+            println!("[exit {}]", status.code().unwrap_or(-1));
+            continue;
+        }
+        match run_agent_turn(&options, &model, input, &mut history).await {
+            Ok(suggestions) => {
+                save_session_history(Some(&session_id), &history)?;
+                visible_followups = suggestions;
+            }
+            Err(error) if error == TURN_INTERRUPTED => {
+                if CTRL_C_COUNT.load(Ordering::SeqCst) >= 2 {
+                    break;
+                }
+                if history.last().is_some_and(|message| {
+                    message.get("role").and_then(Value::as_str) == Some("user")
+                }) {
+                    history.pop();
+                }
+                println!("\nInterrupted.");
+            }
+            Err(error) => {
+                if history.last().is_some_and(|message| {
+                    message.get("role").and_then(Value::as_str) == Some("user")
+                }) {
+                    history.pop();
+                }
+                eprintln!("nio: {error}");
+            }
+        }
+    }
+    println!(
+        "\nSession saved. Resume with: nio --session {}",
+        shell_quote(&session_id)
+    );
+    Ok(())
+}
+
+fn print_session_header(model: &str, session_id: &str) -> Result<(), String> {
+    let config = load_user_config()?;
+    let mode = configured_agent_mode(&config);
+    let effort = config
+        .reasoning_effort
+        .as_deref()
+        .unwrap_or("provider default");
+    print_prompt_divider()?;
+    println!("🤖 NioAI · model {model}");
+    println!("Session ID: {session_id}");
+    println!(
+        "Mode: {} · Reasoning: {}",
+        title_case(mode),
+        title_case(effort)
+    );
+    println!(
+        "Approval: {}",
+        if config.auto_approve_actions.unwrap_or(false) {
+            "Automatic"
+        } else {
+            "Ask before writes and commands"
+        }
+    );
+    Ok(())
+}
+
+fn print_prompt_divider() -> Result<(), String> {
+    let width = terminal::size()
+        .map(|(width, _)| width as usize)
+        .unwrap_or(80)
+        .max(2);
+    queue!(io::stdout(), SetForegroundColor(Color::DarkGrey))
+        .map_err(|error| format!("styling prompt divider: {error}"))?;
+    print!("{}", "─".repeat(width - 1));
+    queue!(io::stdout(), ResetColor).map_err(|error| format!("styling prompt divider: {error}"))?;
+    println!();
+    io::stdout()
+        .flush()
+        .map_err(|error| format!("writing prompt divider: {error}"))
+}
+
+const COMMANDS: [(&str, &str); 10] = [
+    (":clear", "Clear conversation history"),
+    (":help", "Show available commands"),
+    (":model", "Switch model"),
+    (":mode", "Choose Ask, Plan, or Build mode"),
+    (
+        ":approval",
+        "Toggle automatic approval for writes and commands",
+    ),
+    (":provider", "Configure model providers"),
+    (":reasoning", "Set reasoning effort"),
+    (":bash", "Switch to a direct shell prompt"),
+    (
+        ":setting",
+        "Configure mode, reasoning, approvals, and other settings",
+    ),
+    (":quit", "Exit Nio"),
+];
+
+enum PromptInput {
+    Line(String),
+    ModeCycle,
+    Cancelled,
+    Exit,
+    Eof,
+}
+
+struct PaletteScreen {
+    active: bool,
+}
+
+struct MouseCaptureGuard;
+
+impl Drop for MouseCaptureGuard {
+    fn drop(&mut self) {
+        let _ = execute!(io::stdout(), DisableMouseCapture);
+    }
+}
+
+fn draw_followup_buttons(stdout: &mut io::Stdout, suggestions: &[String]) -> Result<(), String> {
+    let width = terminal::size().map(|(width, _)| width).unwrap_or(80) as usize;
+    for (index, suggestion) in suggestions.iter().enumerate() {
+        queue!(stdout, SetForegroundColor(Color::DarkCyan))
+            .map_err(|error| format!("drawing follow-up button: {error}"))?;
+        write!(stdout, "  [{}]", index + 1)
+            .map_err(|error| format!("drawing follow-up button: {error}"))?;
+        queue!(stdout, ResetColor).map_err(|error| format!("drawing follow-up button: {error}"))?;
+        write!(
+            stdout,
+            " {}\r\n",
+            truncate(suggestion, width.saturating_sub(7))
+        )
+        .map_err(|error| format!("drawing follow-up button: {error}"))?;
     }
     Ok(())
+}
+
+impl PaletteScreen {
+    fn new() -> Self {
+        Self { active: false }
+    }
+
+    fn enter(&mut self, stdout: &mut io::Stdout) -> Result<(), String> {
+        self.active = true;
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            Clear(ClearType::All),
+            MoveTo(0, 0)
+        )
+        .map_err(|e| format!("opening command palette: {e}"))?;
+        Ok(())
+    }
+
+    fn leave(&mut self, stdout: &mut io::Stdout) -> Result<(), String> {
+        if self.active {
+            execute!(stdout, LeaveAlternateScreen)
+                .map_err(|e| format!("closing command palette: {e}"))?;
+            self.active = false;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PaletteScreen {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        }
+    }
+}
+
+fn read_interactive_line(
+    prompt: &str,
+    history: &[String],
+    suggestions: &[String],
+) -> Result<PromptInput, String> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        if !suggestions.is_empty() {
+            println!("\nFollow-ups (enter a number to ask, or type your own):");
+            for (index, suggestion) in suggestions.iter().enumerate() {
+                println!("  {}) {suggestion}", index + 1);
+            }
+        }
+        print!("\n{prompt}");
+        io::stdout()
+            .flush()
+            .map_err(|e| format!("writing prompt: {e}"))?;
+        let mut line = String::new();
+        return match io::stdin().read_line(&mut line) {
+            Ok(0) => Ok(PromptInput::Eof),
+            Ok(_) => {
+                let trimmed = line.trim();
+                if let Ok(index) = trimmed.parse::<usize>() {
+                    if let Some(suggestion) = index
+                        .checked_sub(1)
+                        .and_then(|index| suggestions.get(index))
+                    {
+                        return Ok(PromptInput::Line(suggestion.clone()));
+                    }
+                }
+                Ok(PromptInput::Line(line))
+            }
+            Err(e) => Err(format!("reading prompt: {e}")),
+        };
+    }
+
+    terminal::enable_raw_mode().map_err(|e| format!("enabling interactive input: {e}"))?;
+    let result = read_interactive_line_raw(prompt, history, suggestions);
+    let restore = terminal::disable_raw_mode();
+    restore.map_err(|e| format!("restoring terminal input: {e}"))?;
+    result
+}
+
+fn read_interactive_line_raw(
+    prompt: &str,
+    history: &[String],
+    suggestions: &[String],
+) -> Result<PromptInput, String> {
+    let mut stdout = io::stdout();
+    let _mouse_capture = if suggestions.is_empty() {
+        None
+    } else {
+        execute!(stdout, EnableMouseCapture)
+            .map_err(|error| format!("enabling follow-up buttons: {error}"))?;
+        Some(MouseCaptureGuard)
+    };
+    let mut input = String::new();
+    let mut selected = 0usize;
+    let mut history_cursor = None::<usize>;
+    let mut history_draft = None::<String>;
+    let mut palette = PaletteScreen::new();
+    write!(stdout, "\r\n").map_err(|e| format!("writing prompt: {e}"))?;
+    if !suggestions.is_empty() {
+        write!(stdout, "Follow-ups (click to ask, or type your own):\r\n")
+            .map_err(|error| format!("drawing follow-up buttons: {error}"))?;
+        draw_followup_buttons(&mut stdout, suggestions)?;
+        print_prompt_divider()?;
+        write!(stdout, "\r\n").map_err(|error| format!("spacing prompt divider: {error}"))?;
+    }
+    let prompt_row = position().map(|(_, row)| row).unwrap_or(0);
+    let first_suggestion_row = prompt_row.saturating_sub(suggestions.len() as u16);
+    draw_input(&mut stdout, prompt, &input)?;
+
+    loop {
+        let event = event::read().map_err(|e| format!("reading prompt input: {e}"))?;
+        if let Event::Mouse(mouse) = &event {
+            if !palette.active
+                && mouse.kind == MouseEventKind::Down(MouseButton::Left)
+                && mouse.row >= first_suggestion_row
+            {
+                let index = (mouse.row - first_suggestion_row) as usize;
+                if let Some(suggestion) = suggestions.get(index) {
+                    let suggestion = suggestion.clone();
+                    palette.leave(&mut stdout)?;
+                    queue!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))
+                        .map_err(|error| format!("selecting follow-up: {error}"))?;
+                    write!(stdout, "You: {suggestion}\r\n")
+                        .map_err(|error| format!("selecting follow-up: {error}"))?;
+                    stdout
+                        .flush()
+                        .map_err(|error| format!("selecting follow-up: {error}"))?;
+                    return Ok(PromptInput::Line(suggestion));
+                }
+            }
+            continue;
+        }
+        let Event::Key(key) = event else { continue };
+        if key.kind == KeyEventKind::Release {
+            continue;
+        }
+
+        let suggestions = command_suggestions(&input);
+        match key.code {
+            KeyCode::Enter => {
+                if !suggestions.is_empty() && !COMMANDS.iter().any(|(command, _)| *command == input)
+                {
+                    input = suggestions[selected.min(suggestions.len() - 1)].to_string();
+                }
+                palette.leave(&mut stdout)?;
+                queue!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))
+                    .map_err(|e| format!("updating prompt: {e}"))?;
+                write!(stdout, "{prompt}{input}\r\n")
+                    .map_err(|e| format!("writing prompt: {e}"))?;
+                stdout.flush().map_err(|e| format!("writing prompt: {e}"))?;
+                return Ok(PromptInput::Line(input));
+            }
+            KeyCode::Tab if input.is_empty() => {
+                palette.leave(&mut stdout)?;
+                queue!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))
+                    .map_err(|error| format!("updating prompt: {error}"))?;
+                stdout
+                    .flush()
+                    .map_err(|error| format!("updating prompt: {error}"))?;
+                return Ok(PromptInput::ModeCycle);
+            }
+            KeyCode::Tab if !suggestions.is_empty() => {
+                input = suggestions[selected.min(suggestions.len() - 1)].to_string();
+                selected = 0;
+            }
+            KeyCode::Up | KeyCode::Left if palette.active && !suggestions.is_empty() => {
+                selected = selected.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Right if palette.active && !suggestions.is_empty() => {
+                selected = (selected + 1).min(suggestions.len() - 1);
+            }
+            KeyCode::Up if !palette.active && !history.is_empty() => {
+                let cursor = match history_cursor {
+                    Some(cursor) => cursor.saturating_sub(1),
+                    None => {
+                        history_draft = Some(input.clone());
+                        history.len() - 1
+                    }
+                };
+                history_cursor = Some(cursor);
+                input = history[cursor].clone();
+            }
+            KeyCode::Down if !palette.active => {
+                if let Some(cursor) = history_cursor {
+                    if cursor + 1 < history.len() {
+                        let next = cursor + 1;
+                        history_cursor = Some(next);
+                        input = history[next].clone();
+                    } else {
+                        history_cursor = None;
+                        input = history_draft.take().unwrap_or_default();
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                input.pop();
+                selected = 0;
+                history_cursor = None;
+                history_draft = None;
+                if palette.active && input.is_empty() {
+                    palette.leave(&mut stdout)?;
+                }
+            }
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                palette.leave(&mut stdout)?;
+                queue!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))
+                    .map_err(|e| format!("updating prompt: {e}"))?;
+                write!(stdout, "{prompt}^C\r\n").map_err(|e| format!("writing prompt: {e}"))?;
+                stdout.flush().map_err(|e| format!("writing prompt: {e}"))?;
+                return Ok(PromptInput::Cancelled);
+            }
+            KeyCode::Esc => {
+                palette.leave(&mut stdout)?;
+                queue!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))
+                    .map_err(|e| format!("updating prompt: {e}"))?;
+                write!(stdout, "{prompt}(exit)\r\n").map_err(|e| format!("writing prompt: {e}"))?;
+                stdout.flush().map_err(|e| format!("writing prompt: {e}"))?;
+                return Ok(PromptInput::Exit);
+            }
+            KeyCode::Char('d')
+                if key.modifiers.contains(KeyModifiers::CONTROL) && input.is_empty() =>
+            {
+                palette.leave(&mut stdout)?;
+                return Ok(PromptInput::Eof);
+            }
+            KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if input.is_empty() && matches!(character, ':' | '/') {
+                    palette.enter(&mut stdout)?;
+                }
+                input.push(character);
+                selected = 0;
+                history_cursor = None;
+                history_draft = None;
+            }
+            _ => {}
+        }
+        if palette.active {
+            draw_command_palette(&mut stdout, prompt, &input, selected)?;
+        } else {
+            draw_input(&mut stdout, prompt, &input)?;
+        }
+    }
+}
+
+fn command_suggestions(input: &str) -> Vec<&'static str> {
+    let Some(prefix) = input.strip_prefix(':').or_else(|| input.strip_prefix('/')) else {
+        return Vec::new();
+    };
+    COMMANDS
+        .iter()
+        .filter(|(command, _)| {
+            command
+                .strip_prefix(':')
+                .is_some_and(|name| name.starts_with(prefix))
+        })
+        .map(|(command, _)| *command)
+        .collect()
+}
+
+fn terminal_text_width(text: &str) -> usize {
+    text.chars()
+        .map(|ch| {
+            let code = ch as u32;
+            if ch == '\0'
+                || ch.is_control()
+                || matches!(code, 0x0300..=0x036F | 0xFE00..=0xFE0F | 0x200D)
+            {
+                0
+            } else if matches!(
+                code,
+                0x1100..=0x115F
+                    | 0x2329..=0x232A
+                    | 0x2E80..=0xA4CF
+                    | 0xAC00..=0xD7A3
+                    | 0xF900..=0xFAFF
+                    | 0xFE10..=0xFE6F
+                    | 0xFF00..=0xFF60
+                    | 0xFFE0..=0xFFE6
+                    | 0x1F000..=0x1FAFF
+                    | 0x20000..=0x3FFFD
+            ) {
+                2
+            } else {
+                1
+            }
+        })
+        .sum()
+}
+
+fn draw_input(stdout: &mut io::Stdout, prompt: &str, input: &str) -> Result<(), String> {
+    queue!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))
+        .map_err(|e| format!("updating prompt: {e}"))?;
+    write!(stdout, "{prompt}{input}").map_err(|e| format!("writing prompt: {e}"))?;
+    // Leave the cursor where the terminal placed it after rendering the text.
+    // Counting Unicode characters as columns misplaces the cursor for wide glyphs.
+    stdout.flush().map_err(|e| format!("updating prompt: {e}"))
+}
+
+fn draw_command_palette(
+    stdout: &mut io::Stdout,
+    prompt: &str,
+    input: &str,
+    selected: usize,
+) -> Result<(), String> {
+    queue!(stdout, MoveTo(0, 0), Clear(ClearType::All))
+        .map_err(|e| format!("drawing command palette: {e}"))?;
+    write!(stdout, "Commands\r\n").map_err(|e| format!("drawing command palette: {e}"))?;
+    let commands = command_suggestions(input);
+    for (index, command) in commands.iter().enumerate() {
+        if index == selected {
+            queue!(stdout, SetAttribute(Attribute::Reverse))
+                .map_err(|e| format!("styling command palette: {e}"))?;
+            write!(
+                stdout,
+                "› {command:<12} {}\r\n",
+                COMMANDS[index_for_command(command)].1
+            )
+            .map_err(|e| format!("drawing command palette: {e}"))?;
+            queue!(stdout, SetAttribute(Attribute::NoReverse))
+                .map_err(|e| format!("styling command palette: {e}"))?;
+        } else {
+            write!(
+                stdout,
+                "  {command:<12} {}\r\n",
+                COMMANDS[index_for_command(command)].1
+            )
+            .map_err(|e| format!("drawing command palette: {e}"))?;
+        }
+    }
+    write!(stdout, "\r\n").map_err(|e| format!("drawing command palette: {e}"))?;
+    write!(stdout, "{prompt}{input}\r\n").map_err(|e| format!("drawing command palette: {e}"))?;
+    write!(
+        stdout,
+        "↑/↓ select  Tab mode/complete  Enter run  Esc exit\r\n"
+    )
+    .map_err(|e| format!("drawing command palette: {e}"))?;
+    let (width, _) = terminal::size().unwrap_or((80, 24));
+    let cursor_column = (terminal_text_width(prompt) + terminal_text_width(input))
+        .min(width.saturating_sub(1) as usize) as u16;
+    let prompt_row = commands.len().saturating_add(2) as u16;
+    queue!(stdout, MoveTo(cursor_column, prompt_row))
+        .map_err(|e| format!("positioning command palette cursor: {e}"))?;
+    stdout
+        .flush()
+        .map_err(|e| format!("drawing command palette: {e}"))
+}
+
+fn index_for_command(command: &str) -> usize {
+    COMMANDS
+        .iter()
+        .position(|(name, _)| *name == command)
+        .unwrap_or(0)
 }
 
 async fn chosen_model(options: &Options) -> Result<String, String> {
@@ -990,50 +2421,266 @@ async fn chosen_model(options: &Options) -> Result<String, String> {
     } else if let Some(model) = read_saved_model()? {
         Ok(model)
     } else {
-        select_and_save_model(options).await
+        select_and_save_model(options)
+            .await?
+            .ok_or_else(|| "model selection cancelled".to_string())
     }
 }
 
-async fn select_and_save_model(options: &Options) -> Result<String, String> {
-    println!("Choose your default model (free models are shown):");
-    let choices = fetch_model_choices(options, false).await?;
+async fn select_and_save_model(options: &Options) -> Result<Option<String>, String> {
+    let choices = fetch_model_choices(options).await?;
     if choices.is_empty() {
-        return Err("no free models are available from the configured gateways".into());
+        return Err("no models are available from the configured providers".into());
     }
-    for (index, choice) in choices.iter().enumerate() {
-        println!(
-            "  {}) {} ({})",
-            index + 1,
-            choice.name,
-            choice.gateway_label
-        );
-    }
-    print!("Select a model [1-{}]: ", choices.len());
-    io::stdout()
-        .flush()
-        .map_err(|e| format!("writing model selection: {e}"))?;
-    let mut selection = String::new();
-    io::stdin()
-        .read_line(&mut selection)
-        .map_err(|e| format!("reading model selection: {e}"))?;
-    let index = selection
-        .trim()
-        .parse::<usize>()
-        .map_err(|_| "enter the number shown beside a model".to_string())?;
-    let choice = choices
-        .get(
-            index
-                .checked_sub(1)
-                .ok_or("model selection is out of range")?,
-        )
-        .ok_or("model selection is out of range")?;
+    let current_model = options.model.clone().or(read_saved_model()?);
+    let Some(index) = choose_model_index(&choices, current_model.as_deref())? else {
+        return Ok(None);
+    };
+    let choice = &choices[index];
     let selector = choice.selector();
     save_default_model(&selector)?;
     println!(
         "Saved default model: {} ({})",
         choice.name, choice.gateway_label
     );
-    Ok(selector)
+    Ok(Some(selector))
+}
+
+fn choose_model_index(
+    choices: &[ModelChoice],
+    current_model: Option<&str>,
+) -> Result<Option<usize>, String> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        println!("Choose your default model (free models listed first):");
+        for (index, choice) in choices.iter().enumerate() {
+            println!(
+                "  {}{}) {} ({})",
+                if current_model == Some(choice.selector().as_str()) {
+                    "✓ "
+                } else {
+                    "  "
+                },
+                index + 1,
+                choice.name,
+                choice.gateway_label
+            );
+        }
+        print!("Select a model [1-{}]: ", choices.len());
+        io::stdout()
+            .flush()
+            .map_err(|e| format!("writing model selection: {e}"))?;
+        let mut selection = String::new();
+        io::stdin()
+            .read_line(&mut selection)
+            .map_err(|e| format!("reading model selection: {e}"))?;
+        let index = selection
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| "enter the number shown beside a model".to_string())?;
+        return index
+            .checked_sub(1)
+            .filter(|index| *index < choices.len())
+            .map(Some)
+            .ok_or_else(|| "model selection is out of range".to_string());
+    }
+
+    terminal::enable_raw_mode().map_err(|e| format!("enabling model picker: {e}"))?;
+    let result = choose_model_index_raw(choices, current_model);
+    let restore = terminal::disable_raw_mode();
+    restore.map_err(|e| format!("restoring terminal input: {e}"))?;
+    result
+}
+
+fn choose_model_index_raw(
+    choices: &[ModelChoice],
+    current_model: Option<&str>,
+) -> Result<Option<usize>, String> {
+    const PAGE_SIZE: usize = 25;
+    let mut stdout = io::stdout();
+    let mut screen = PaletteScreen::new();
+    screen.enter(&mut stdout)?;
+    let mut query = String::new();
+    let mut selected = current_model
+        .and_then(|model| choices.iter().position(|choice| choice.selector() == model))
+        .unwrap_or(0);
+    draw_model_picker(&mut stdout, choices, selected, current_model, &query)?;
+    loop {
+        let event = event::read().map_err(|e| format!("reading model selection: {e}"))?;
+        let Event::Key(key) = event else { continue };
+        if key.kind == KeyEventKind::Release {
+            continue;
+        }
+        match key.code {
+            KeyCode::Up => selected = selected.saturating_sub(1),
+            KeyCode::Down => {
+                let matches = filtered_model_indices(choices, &query);
+                selected = selected
+                    .saturating_add(1)
+                    .min(matches.len().saturating_sub(1));
+            }
+            KeyCode::Left => {
+                selected = selected.saturating_sub(PAGE_SIZE);
+            }
+            KeyCode::Right => {
+                let matches = filtered_model_indices(choices, &query);
+                selected = selected
+                    .saturating_add(PAGE_SIZE)
+                    .min(matches.len().saturating_sub(1));
+            }
+            KeyCode::Enter => {
+                let matches = filtered_model_indices(choices, &query);
+                if let Some(choice_index) = matches.get(selected).copied() {
+                    screen.leave(&mut stdout)?;
+                    return Ok(Some(choice_index));
+                }
+            }
+            KeyCode::Esc => {
+                if !query.is_empty() {
+                    query.clear();
+                    selected = 0;
+                    draw_model_picker(&mut stdout, choices, selected, current_model, &query)?;
+                    continue;
+                }
+                screen.leave(&mut stdout)?;
+                return Ok(None);
+            }
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let count = CTRL_C_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
+                screen.leave(&mut stdout)?;
+                if count >= 2 {
+                    return Ok(None);
+                }
+                return Ok(None);
+            }
+            KeyCode::Backspace => {
+                query.pop();
+                selected = 0;
+            }
+            KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                query.push(character);
+                selected = 0;
+            }
+            _ => {}
+        }
+        let matches = filtered_model_indices(choices, &query);
+        selected = selected.min(matches.len().saturating_sub(1));
+        draw_model_picker(&mut stdout, choices, selected, current_model, &query)?;
+    }
+}
+
+fn filtered_model_indices(choices: &[ModelChoice], query: &str) -> Vec<usize> {
+    let query = query.trim().to_lowercase();
+    choices
+        .iter()
+        .enumerate()
+        .filter_map(|(index, choice)| {
+            let matches = query.is_empty()
+                || choice.name.to_lowercase().contains(&query)
+                || choice.gateway_label.to_lowercase().contains(&query)
+                || choice.selector().to_lowercase().contains(&query);
+            matches.then_some(index)
+        })
+        .collect()
+}
+
+fn draw_model_picker(
+    stdout: &mut io::Stdout,
+    choices: &[ModelChoice],
+    selected: usize,
+    current_model: Option<&str>,
+    query: &str,
+) -> Result<(), String> {
+    const PAGE_SIZE: usize = 25;
+    let (width, height) = terminal::size().unwrap_or((80, 24));
+    let matches = filtered_model_indices(choices, query);
+    let page = selected / PAGE_SIZE;
+    let page_start = page * PAGE_SIZE;
+    let page_end = (page_start + PAGE_SIZE).min(matches.len());
+    let visible_rows = height.saturating_sub(7).max(1) as usize;
+    let page_offset = selected.saturating_sub(page_start);
+    let visible_start = page_offset
+        .saturating_sub(visible_rows / 2)
+        .min(page_end.saturating_sub(page_start + visible_rows));
+    let start = page_start + visible_start;
+    let end = (start + visible_rows).min(page_end);
+    queue!(stdout, MoveTo(0, 0), Clear(ClearType::All))
+        .map_err(|e| format!("drawing model picker: {e}"))?;
+    write!(
+        stdout,
+        "Choose a model  ↑/↓ move  ←/→ page (25)  Enter select  Esc clear/cancel\r\n"
+    )
+    .map_err(|e| format!("drawing model picker: {e}"))?;
+    let search_prompt = "Search model/provider: ";
+    let terminal_columns = (width as usize).max(1);
+    let query_chars = query.chars().collect::<Vec<_>>();
+    let query_columns = terminal_columns
+        .saturating_sub(search_prompt.chars().count())
+        .max(1);
+    let visible_query = query_chars
+        .iter()
+        .skip(query_chars.len().saturating_sub(query_columns))
+        .collect::<String>();
+    write!(stdout, "{search_prompt}{visible_query}\r\n")
+        .map_err(|e| format!("drawing model picker: {e}"))?;
+    if matches.is_empty() {
+        write!(
+            stdout,
+            "  No matches. Edit the search or press Esc to clear it.\r\n"
+        )
+        .map_err(|e| format!("drawing model picker: {e}"))?;
+    }
+    for (visible_index, choice_index) in matches.iter().enumerate().take(end).skip(start) {
+        let choice = &choices[*choice_index];
+        let free_tag = if choice.free { " · free" } else { "" };
+        let row = format!("{} ({}){free_tag}", choice.name, choice.gateway_label);
+        let marker = if current_model == Some(choice.selector().as_str()) {
+            "✓"
+        } else {
+            " "
+        };
+        if visible_index == selected {
+            queue!(stdout, SetAttribute(Attribute::Reverse))
+                .map_err(|e| format!("styling model picker: {e}"))?;
+            write!(
+                stdout,
+                "› {} {}\r\n",
+                marker,
+                truncate(&row, width.saturating_sub(5) as usize)
+            )
+            .map_err(|e| format!("drawing model picker: {e}"))?;
+            queue!(stdout, SetAttribute(Attribute::NoReverse))
+                .map_err(|e| format!("styling model picker: {e}"))?;
+        } else {
+            write!(
+                stdout,
+                "  {} {}\r\n",
+                marker,
+                truncate(&row, width.saturating_sub(5) as usize)
+            )
+            .map_err(|e| format!("drawing model picker: {e}"))?;
+        }
+    }
+    write!(
+        stdout,
+        "\r\nPage {}/{} · {}–{} of {} matches\r\n",
+        if matches.is_empty() { 0 } else { page + 1 },
+        matches.len().div_ceil(PAGE_SIZE),
+        if matches.is_empty() {
+            0
+        } else {
+            page_start + 1
+        },
+        page_end,
+        matches.len()
+    )
+    .map_err(|e| format!("drawing model picker: {e}"))?;
+    let cursor_column = (terminal_text_width(search_prompt) + terminal_text_width(&visible_query))
+        .min(terminal_columns.saturating_sub(1)) as u16;
+    queue!(stdout, MoveTo(cursor_column, 1))
+        .map_err(|e| format!("positioning model search cursor: {e}"))?;
+    stdout
+        .flush()
+        .map_err(|e| format!("drawing model picker: {e}"))
 }
 
 fn config_path() -> Result<PathBuf, String> {
@@ -1048,29 +2695,512 @@ fn config_path() -> Result<PathBuf, String> {
 }
 
 fn read_saved_model() -> Result<Option<String>, String> {
+    Ok(load_user_config()?.default_model)
+}
+
+fn load_user_config() -> Result<UserConfig, String> {
     let path = config_path()?;
     let contents = match std::fs::read_to_string(&path) {
         Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(UserConfig::default());
+        }
         Err(error) => return Err(format!("reading {}: {error}", path.display())),
     };
-    let config: UserConfig = serde_json::from_str(&contents)
-        .map_err(|error| format!("invalid config at {}: {error}", path.display()))?;
-    Ok(config.default_model)
+    serde_json::from_str(&contents)
+        .map_err(|error| format!("invalid config at {}: {error}", path.display()))
 }
 
 fn save_default_model(model: &str) -> Result<(), String> {
+    let mut config = load_user_config()?;
+    config.default_model = Some(model.to_string());
+    save_user_config(&config)
+}
+
+fn save_prompt_history(history: &[String]) -> Result<(), String> {
+    let mut config = load_user_config()?;
+    config.prompt_history = history.to_vec();
+    save_user_config(&config)
+}
+
+fn session_history_path(session_id: &str) -> Result<PathBuf, String> {
+    if session_id.is_empty() {
+        return Err("session ID must not be empty".into());
+    }
+    if session_id.len() > 120 {
+        return Err("session ID must be 120 bytes or fewer".into());
+    }
+    let config = config_path()?;
+    let directory = config
+        .parent()
+        .ok_or("config file path has no parent directory")?
+        .join("sessions");
+    let encoded_id = session_id
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(directory.join(format!("{encoded_id}.json")))
+}
+
+fn generate_session_id() -> String {
+    const ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    loop {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos() as u64)
+            .unwrap_or_default();
+        let count = SESSION_ID_COUNTER.fetch_add(1, Ordering::Relaxed) as u64;
+        let mut value = nanos ^ (u64::from(std::process::id()) << 32) ^ count;
+        value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^= value >> 31;
+        let mut id = [b'0'; 8];
+        for character in id.iter_mut().rev() {
+            *character = ALPHABET[(value % ALPHABET.len() as u64) as usize];
+            value /= ALPHABET.len() as u64;
+        }
+        let id = format!("nio-{}", String::from_utf8_lossy(&id));
+        if session_history_path(&id)
+            .map(|path| !path.exists())
+            .unwrap_or(true)
+        {
+            return id;
+        }
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn load_session_history(session_id: Option<&str>) -> Result<Vec<Value>, String> {
+    let Some(session_id) = session_id else {
+        return Ok(Vec::new());
+    };
+    let path = session_history_path(session_id)?;
+    match std::fs::read(&path) {
+        Ok(contents) => serde_json::from_slice(&contents)
+            .map_err(|error| format!("invalid session history at {}: {error}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(format!(
+            "reading session history {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn save_session_history(session_id: Option<&str>, history: &[Value]) -> Result<(), String> {
+    let Some(session_id) = session_id else {
+        return Ok(());
+    };
+    let path = session_history_path(session_id)?;
+    let parent = path
+        .parent()
+        .ok_or("session history path has no parent directory")?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("creating session directory {}: {error}", parent.display()))?;
+    let contents = serde_json::to_vec(history)
+        .map_err(|error| format!("serializing session history: {error}"))?;
+    std::fs::write(&path, contents)
+        .map_err(|error| format!("writing session history {}: {error}", path.display()))
+}
+
+fn save_user_config(config: &UserConfig) -> Result<(), String> {
     let path = config_path()?;
     let parent = path
         .parent()
         .ok_or("config file path has no parent directory")?;
     std::fs::create_dir_all(parent)
         .map_err(|error| format!("creating {}: {error}", parent.display()))?;
-    let contents = serde_json::to_vec_pretty(&UserConfig {
-        default_model: Some(model.to_string()),
-    })
-    .map_err(|error| format!("serializing config: {error}"))?;
-    std::fs::write(&path, contents).map_err(|error| format!("writing {}: {error}", path.display()))
+    let contents = serde_json::to_vec_pretty(config)
+        .map_err(|error| format!("serializing config: {error}"))?;
+    std::fs::write(&path, contents)
+        .map_err(|error| format!("writing {}: {error}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&path)
+            .map_err(|error| format!("checking permissions for {}: {error}", path.display()))?
+            .permissions();
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(&path, permissions).map_err(|error| {
+            format!(
+                "protecting provider credentials in {}: {error}",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+async fn configure_provider() -> Result<(), String> {
+    let mut config = load_user_config()?;
+    println!("\nModel providers");
+    for (index, (id, name, _)) in PROVIDER_PRESETS.iter().enumerate() {
+        let free_tag = provider_free_label(id)
+            .map(|label| format!(" ({label})"))
+            .unwrap_or_default();
+        println!("  {}) {name}{free_tag}", index + 1);
+    }
+    let custom_option = PROVIDER_PRESETS.len() + 1;
+    let remove_option = PROVIDER_PRESETS.len() + 2;
+    println!("  {custom_option}) Custom OpenAI-compatible provider");
+    println!("  {remove_option}) Remove a saved provider");
+    if !config.providers.is_empty() {
+        println!(
+            "\nSaved: {}",
+            config
+                .providers
+                .iter()
+                .map(|provider| provider.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    println!("🔹 (free) = provider offers a free model catalog");
+    println!(
+        "🔹 Most providers ask you to bring your own API key (BYOK). Free access may still need a key."
+    );
+    print!("Choose [1-{remove_option}], or Enter to cancel: ");
+    io::stdout()
+        .flush()
+        .map_err(|error| format!("writing provider prompt: {error}"))?;
+    let mut selection = String::new();
+    io::stdin()
+        .read_line(&mut selection)
+        .map_err(|error| format!("reading provider choice: {error}"))?;
+    let selected = selection.trim().parse::<usize>().ok();
+    let id = match selected {
+        Some(number) if (1..=PROVIDER_PRESETS.len()).contains(&number) => {
+            PROVIDER_PRESETS[number - 1].0.to_string()
+        }
+        Some(number) if number == custom_option => {
+            print!("Provider ID (lowercase, e.g. orca): ");
+            io::stdout()
+                .flush()
+                .map_err(|error| format!("writing provider ID prompt: {error}"))?;
+            let mut custom_id = String::new();
+            io::stdin()
+                .read_line(&mut custom_id)
+                .map_err(|error| format!("reading provider ID: {error}"))?;
+            custom_id.trim().to_ascii_lowercase()
+        }
+        Some(number) if number == remove_option && !config.providers.is_empty() => {
+            println!("Choose a provider to remove:");
+            for (index, provider) in config.providers.iter().enumerate() {
+                println!("  {}) {}", index + 1, provider.id);
+            }
+            print!("Provider number, or Enter to cancel: ");
+            io::stdout()
+                .flush()
+                .map_err(|error| format!("writing remove prompt: {error}"))?;
+            let mut number = String::new();
+            io::stdin()
+                .read_line(&mut number)
+                .map_err(|error| format!("reading provider choice: {error}"))?;
+            let Ok(index) = number.trim().parse::<usize>() else {
+                return Ok(());
+            };
+            if index == 0 || index > config.providers.len() {
+                return Ok(());
+            }
+            let removed = config.providers.remove(index - 1).id;
+            save_user_config(&config)?;
+            println!("Removed provider '{removed}'.");
+            return Ok(());
+        }
+        None if selection.trim().is_empty() => return Ok(()),
+        _ => {
+            println!("Choose a number from the list.");
+            return Ok(());
+        }
+    };
+    if id.is_empty() {
+        return Ok(());
+    }
+    if !id
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '-' | '_' | '.'))
+    {
+        return Err(
+            "provider ID may contain lowercase letters, numbers, '.', '_' and '-' only".into(),
+        );
+    }
+    if id == "kilo" {
+        return Err("Kilo Gateway is built in and does not need provider setup".into());
+    }
+    let existing = config
+        .providers
+        .iter()
+        .find(|provider| provider.id == id)
+        .cloned();
+    let preset = PROVIDER_PRESETS
+        .iter()
+        .find(|(provider_id, _, _)| *provider_id == id)
+        .map(|(_, _, url)| *url);
+    let default_url = existing
+        .as_ref()
+        .map(|provider| provider.base_url.as_str())
+        .or(preset)
+        .unwrap_or("");
+    print!("OpenAI-compatible base URL [{default_url}]: ");
+    io::stdout()
+        .flush()
+        .map_err(|error| format!("writing provider URL prompt: {error}"))?;
+    let mut base_url = String::new();
+    io::stdin()
+        .read_line(&mut base_url)
+        .map_err(|error| format!("reading provider URL: {error}"))?;
+    let base_url = if base_url.trim().is_empty() {
+        default_url.to_string()
+    } else {
+        base_url.trim().trim_end_matches('/').to_string()
+    };
+    let parsed = reqwest::Url::parse(&base_url).map_err(|_| {
+        "enter a valid provider base URL, such as https://host.example/v1".to_string()
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err("provider URL must use http:// or https:// and include a host".into());
+    }
+    let key =
+        read_provider_key("API key (visible; Enter keeps existing, type 'clear' to remove): ")?;
+    let key = if key.trim().is_empty() {
+        existing.and_then(|provider| provider.api_key)
+    } else if key.trim().eq_ignore_ascii_case("clear") {
+        None
+    } else {
+        Some(key.trim().to_string())
+    };
+    let provider = ProviderConfig {
+        id: id.clone(),
+        name: PROVIDER_PRESETS
+            .iter()
+            .find(|(provider_id, _, _)| *provider_id == id)
+            .map(|(_, name, _)| (*name).to_string())
+            .unwrap_or_else(|| id.clone()),
+        base_url: base_url.clone(),
+        api_key: key,
+    };
+    if let Some(index) = config.providers.iter().position(|current| current.id == id) {
+        config.providers[index] = provider;
+    } else {
+        config.providers.push(provider);
+    }
+    save_user_config(&config)?;
+    println!("Saved provider '{id}' ({base_url}). Use :model to browse its models.");
+    Ok(())
+}
+
+fn read_provider_key(prompt: &str) -> Result<String, String> {
+    print!("{prompt}");
+    io::stdout()
+        .flush()
+        .map_err(|error| format!("writing provider key prompt: {error}"))?;
+    let mut value = String::new();
+    io::stdin()
+        .read_line(&mut value)
+        .map_err(|error| format!("reading provider key: {error}"))?;
+    Ok(value.trim_end().to_string())
+}
+
+fn configure_settings() -> Result<(), String> {
+    let mut config = load_user_config()?;
+    let followups_enabled = config.follow_up_suggestions.unwrap_or(true);
+    let mode = configured_agent_mode(&config);
+    let effort = config
+        .reasoning_effort
+        .as_deref()
+        .unwrap_or("provider default");
+    println!("Settings");
+    println!(
+        "  1) Minimum delay between model requests: {}s",
+        config
+            .request_interval_seconds
+            .unwrap_or(DEFAULT_REQUEST_INTERVAL_SECONDS)
+    );
+    println!(
+        "  2) Follow-up suggestions: {}",
+        if followups_enabled { "On" } else { "Off" }
+    );
+    println!("  3) Agent mode: {}", title_case(mode));
+    println!("  4) Reasoning effort: {}", title_case(effort));
+    let auto_approve = config.auto_approve_actions.unwrap_or(false);
+    println!(
+        "  5) Auto-approve writes and commands: {}",
+        if auto_approve { "On" } else { "Off" }
+    );
+    print!("Choose a setting [1-5] or Enter to cancel: ");
+    io::stdout()
+        .flush()
+        .map_err(|error| format!("writing settings menu: {error}"))?;
+    let mut selection = String::new();
+    io::stdin()
+        .read_line(&mut selection)
+        .map_err(|error| format!("reading settings choice: {error}"))?;
+    match selection.trim() {
+        "1" => configure_request_interval(&mut config),
+        "2" => {
+            config.follow_up_suggestions = Some(!followups_enabled);
+            save_user_config(&config)?;
+            println!(
+                "Follow-up suggestions {}.",
+                if !followups_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
+            Ok(())
+        }
+        "3" => configure_agent_mode(),
+        "4" => configure_reasoning_effort(),
+        "5" => toggle_auto_approval(),
+        "" => Ok(()),
+        _ => {
+            eprintln!("Choose 1–5. Settings unchanged.");
+            Ok(())
+        }
+    }
+}
+
+fn toggle_auto_approval() -> Result<(), String> {
+    let mut config = load_user_config()?;
+    let enabled = !config.auto_approve_actions.unwrap_or(false);
+    config.auto_approve_actions = Some(enabled);
+    save_user_config(&config)?;
+    if enabled {
+        println!("Automatic approval enabled: file writes and shell commands run without asking.");
+    } else {
+        println!("Automatic approval disabled: Nio asks before file writes and shell commands.");
+    }
+    Ok(())
+}
+
+fn configure_agent_mode() -> Result<(), String> {
+    let mut config = load_user_config()?;
+    let current = configured_agent_mode(&config);
+    println!("Agent mode (current: {})", title_case(current));
+    println!("  1) Ask   Answer questions; inspect files for context, no changes or commands");
+    println!("  2) Plan  Inspect files and return a plan; no changes or commands");
+    println!("  3) Build Implement changes; ask before edits and commands");
+    print!("Choose mode [1-3] or Enter to keep: ");
+    io::stdout()
+        .flush()
+        .map_err(|error| format!("writing mode prompt: {error}"))?;
+    let mut value = String::new();
+    io::stdin()
+        .read_line(&mut value)
+        .map_err(|error| format!("reading agent mode: {error}"))?;
+    let mode = match value.trim() {
+        "1" => "ask",
+        "2" => "plan",
+        "3" => "build",
+        "" => return Ok(()),
+        _ => {
+            eprintln!("Choose 1, 2, or 3. Mode unchanged.");
+            return Ok(());
+        }
+    };
+    config.agent_mode = Some(mode.to_string());
+    save_user_config(&config)?;
+    println!("Agent mode set to {}.", title_case(mode));
+    Ok(())
+}
+
+fn cycle_agent_mode() -> Result<(), String> {
+    let mut config = load_user_config()?;
+    let current = configured_agent_mode(&config);
+    let next = match current {
+        "ask" => "plan",
+        "plan" => "build",
+        _ => "ask",
+    };
+    config.agent_mode = Some(next.to_string());
+    save_user_config(&config)?;
+    Ok(())
+}
+
+fn configure_reasoning_effort() -> Result<(), String> {
+    let mut config = load_user_config()?;
+    let current = config
+        .reasoning_effort
+        .as_deref()
+        .unwrap_or("provider default");
+    println!("Reasoning effort (current: {})", title_case(current));
+    println!("  1) Low      Faster, lighter reasoning");
+    println!("  2) Medium   Balanced reasoning");
+    println!("  3) High     More detailed reasoning");
+    println!("  4) Provider default   Let the model provider decide");
+    print!("Choose effort [1-4] or Enter to keep: ");
+    io::stdout()
+        .flush()
+        .map_err(|error| format!("writing effort prompt: {error}"))?;
+    let mut value = String::new();
+    io::stdin()
+        .read_line(&mut value)
+        .map_err(|error| format!("reading reasoning effort: {error}"))?;
+    let effort = match value.trim() {
+        "1" => Some("low"),
+        "2" => Some("medium"),
+        "3" => Some("high"),
+        "4" => None,
+        "" => return Ok(()),
+        _ => {
+            eprintln!("Choose 1, 2, 3, or 4. Effort unchanged.");
+            return Ok(());
+        }
+    };
+    config.reasoning_effort = effort.map(str::to_string);
+    save_user_config(&config)?;
+    println!(
+        "Reasoning effort set to {}.",
+        effort
+            .map(title_case)
+            .unwrap_or_else(|| "provider default".to_string())
+    );
+    Ok(())
+}
+
+fn title_case(value: &str) -> String {
+    let mut chars = value.chars();
+    chars
+        .next()
+        .map(|first| first.to_uppercase().to_string() + chars.as_str())
+        .unwrap_or_default()
+}
+
+fn configure_request_interval(config: &mut UserConfig) -> Result<(), String> {
+    let current = config
+        .request_interval_seconds
+        .unwrap_or(DEFAULT_REQUEST_INTERVAL_SECONDS);
+    println!("Minimum delay between model requests: {current}s");
+    print!("New delay in seconds (0–60, Enter to keep): ");
+    io::stdout()
+        .flush()
+        .map_err(|error| format!("writing settings prompt: {error}"))?;
+    let mut value = String::new();
+    io::stdin()
+        .read_line(&mut value)
+        .map_err(|error| format!("reading setting: {error}"))?;
+    let value = value.trim();
+    if value.is_empty() {
+        println!("Keeping {current}s.");
+        return Ok(());
+    }
+    let Ok(seconds) = value.parse::<u64>() else {
+        eprintln!("Enter a whole number from 0 to 60. Setting unchanged.");
+        return Ok(());
+    };
+    if seconds > 60 {
+        eprintln!("Request delay must be between 0 and 60 seconds. Setting unchanged.");
+        return Ok(());
+    }
+    config.request_interval_seconds = Some(seconds);
+    save_user_config(&config)?;
+    println!("Saved request delay: {seconds}s.");
+    Ok(())
 }
 
 fn endpoint(base: &str, suffix: &str) -> String {
@@ -1079,17 +3209,6 @@ fn endpoint(base: &str, suffix: &str) -> String {
         base.trim_end_matches('/'),
         suffix.trim_start_matches('/')
     )
-}
-
-fn supports_anonymous_gateway(base: &str) -> bool {
-    let Ok(url) = reqwest::Url::parse(base) else {
-        return false;
-    };
-    // Kilo limits unauthenticated access to free models. Its catalog may mark
-    // free models without the `:free` suffix, so let the gateway enforce access.
-    url.scheme() == "https"
-        && url.host_str() == Some("api.kilo.ai")
-        && url.path().trim_end_matches('/') == "/api/gateway"
 }
 
 fn split_model_selector(model: &str) -> Result<(Option<&str>, &str), String> {
@@ -1112,17 +3231,76 @@ fn model_api_key(options: &Options, gateway: &str) -> Option<String> {
         .api_key
         .as_deref()
         .filter(|value| !value.trim().is_empty());
-    let provider_key = match gateway {
+    let env_key = match gateway {
         "kilo" => env::var("KILO_API_KEY").ok(),
         "openrouter" => env::var("OPENROUTER_API_KEY").ok(),
-        _ => None,
+        "orca" => env::var("ORCA_API_KEY")
+            .ok()
+            .or_else(|| env::var("NIO_ORCA_API_KEY").ok()),
+        "claude" => env::var("ANTHROPIC_API_KEY")
+            .ok()
+            .or_else(|| env::var("NIO_CLAUDE_API_KEY").ok()),
+        "codex" => env::var("OPENAI_API_KEY")
+            .ok()
+            .or_else(|| env::var("NIO_CODEX_API_KEY").ok()),
+        other => env::var(format!(
+            "NIO_{}_API_KEY",
+            other
+                .to_ascii_uppercase()
+                .replace('-', "_")
+                .replace('.', "_")
+        ))
+        .ok(),
     };
-    provider_key.or_else(|| explicit.map(str::to_string))
+    let saved_key = load_user_config().ok().and_then(|config| {
+        config
+            .providers
+            .into_iter()
+            .find(|provider| provider.id == gateway)
+            .and_then(|provider| provider.api_key)
+    });
+    env_key
+        .filter(|key| !key.trim().is_empty())
+        .or(saved_key.filter(|key| !key.trim().is_empty()))
+        .or_else(|| explicit.map(str::to_string))
+}
+
+fn resolve_model_provider(
+    options: &Options,
+    gateway: Option<&str>,
+    model_id: &str,
+) -> Result<(String, Option<String>), String> {
+    let Some(gateway) = gateway.or_else(|| model_id.starts_with("kilo-auto/").then_some("kilo"))
+    else {
+        return Ok((options.base_url.clone(), options.api_key.clone()));
+    };
+    let config = load_user_config()?;
+    let saved = config
+        .providers
+        .iter()
+        .find(|provider| provider.id == gateway);
+    let base_url = match gateway {
+        "kilo" => KILO_BASE_URL.to_string(),
+        "openrouter" => saved
+            .map(|provider| provider.base_url.clone())
+            .unwrap_or_else(|| OPENROUTER_BASE_URL.to_string()),
+        other => saved
+            .map(|provider| provider.base_url.clone())
+            .ok_or_else(|| {
+                format!("provider '{other}' is not configured; use :provider to add it")
+            })?,
+    };
+    let key = model_api_key(options, gateway);
+    Ok((base_url, key))
 }
 
 impl ModelInfo {
     fn is_free(&self) -> bool {
-        if self.free == Some(true) || self.id.ends_with(":free") || self.id == "kilo-auto/free" {
+        if self.free == Some(true)
+            || self.id.ends_with(":free")
+            || self.id.ends_with("-free")
+            || self.id == "kilo-auto/free"
+        {
             return true;
         }
         let Some(pricing) = &self.pricing else {
@@ -1148,6 +3326,68 @@ fn truncate(value: &str, max: usize) -> String {
     format!("{}…", value.chars().take(max).collect::<String>())
 }
 
+fn format_provider_error(status: u16, body: &str, gateway: Option<&str>) -> String {
+    if status == 429 {
+        let own_key = match gateway {
+            Some("openrouter") => "OPENROUTER_API_KEY",
+            Some("kilo") => "KILO_API_KEY",
+            _ => "NIO_API_KEY",
+        };
+        return format!(
+            "This model is temporarily rate-limited by its provider (HTTP 429).\n\
+             Try again in a few minutes, choose another model with `nio models`, or set your own provider key (`{own_key}`) to use your own limits."
+        );
+    }
+
+    let detail = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/error/message")
+                .or_else(|| value.get("message"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| truncate(body.trim(), 500));
+    if detail.is_empty() {
+        format!("The provider returned HTTP {status}.")
+    } else {
+        format!("The provider returned HTTP {status}: {detail}")
+    }
+}
+
+fn rate_limit_retry_delay(
+    headers: &reqwest::header::HeaderMap,
+    retry_count: u32,
+) -> Option<std::time::Duration> {
+    const MAX_SERVER_WAIT: u64 = 120;
+    if let Some(seconds) = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return (seconds <= MAX_SERVER_WAIT).then(|| std::time::Duration::from_secs(seconds));
+    }
+    if let Some(reset) = headers
+        .get("x-ratelimit-reset")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+        let reset = if reset > 10_000_000_000 {
+            reset / 1000
+        } else {
+            reset
+        };
+        let seconds = reset.saturating_sub(now);
+        return (seconds <= MAX_SERVER_WAIT).then(|| std::time::Duration::from_secs(seconds));
+    }
+    Some(std::time::Duration::from_secs(2u64 << retry_count.min(2)))
+}
+
 fn print_help() {
     println!(
         "NioAI — a lightweight AI coding agent for the terminal\n\
@@ -1155,20 +3395,29 @@ fn print_help() {
 Usage:\n\
   nio [OPTIONS]                 Start the interactive prompt UI\n\
   nio run [OPTIONS] <prompt>\n\
-  nio models [--all]\n\
-  nio --help | --version\n\
+  nio models\n\
+  nio provider                 Configure model providers\n\
+  nio --help | --version (-v, --v)\n\
 \
 Options:\n\
   -m, --model <SELECTOR> Model selector from 'nio models' (or NIO_MODEL)\n\
-      --all              Include paid models in model listing\n\
+  -s, --session <ID> Resume a saved conversation\n\
   --base-url <URL>   OpenAI-compatible API base URL (or NIO_BASE_URL)\n\
   --api-key <KEY>    API key (or NIO_API_KEY / OPENROUTER_API_KEY)\n\
   --format json      Emit NoIDE-compatible NDJSON events\n\
   --dir <PATH>       Set the project working directory\n\
+  -s, --session <ID> Resume a persistent conversation session\n\
   --auto             Approve file writes and shell commands\n\
 \n\
 Interactive commands:\n\
   :clear             Clear conversation history\n\
+  :model             Switch the active model (free catalog)\n\
+  :bash              Switch to a direct shell command prompt (:ai returns)\n\
+  :mode              Choose Ask, Plan, or Build mode\n\
+  :approval          Toggle automatic approval for writes and commands\n\
+  :reasoning         Set reasoning effort\n\
+  :provider          Add or update an OpenAI-compatible provider\n\
+  :setting           Configure mode, reasoning, and approvals\n\
   :quit              Exit\n\
 \
 Example:\n\
