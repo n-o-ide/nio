@@ -3060,22 +3060,7 @@ async fn configure_proxy() -> Result<(), String> {
     config.proxy_url = Some(input.to_string());
     save_user_config(&config)?;
     println!("Saved proxy {}.", safe_proxy_label(input));
-    println!("Checking OpenRouter connectivity without sending your API key...");
-    match probe_openrouter_through_proxy(input).await {
-        Ok(status) if status == reqwest::StatusCode::UNAUTHORIZED || status.is_success() => {
-            println!(
-                "Proxy reached OpenRouter (HTTP {status}); API-key authentication was not tested."
-            );
-        }
-        Ok(status) => {
-            println!(
-                "Proxy reached an HTTP response from OpenRouter (HTTP {status}); the endpoint or a network policy may have denied the request."
-            );
-        }
-        Err(error) => {
-            println!("Proxy connectivity check failed: {error}");
-        }
-    }
+    check_provider_connectivity(input, &config.providers).await?;
     Ok(())
 }
 
@@ -3099,20 +3084,80 @@ fn safe_proxy_label(input: &str) -> String {
     url.to_string()
 }
 
-async fn probe_openrouter_through_proxy(proxy_url: &str) -> Result<reqwest::StatusCode, String> {
+async fn check_provider_connectivity(
+    proxy_url: &str,
+    configured_providers: &[ProviderConfig],
+) -> Result<(), String> {
     let proxy =
         reqwest::Proxy::all(proxy_url).map_err(|_| "invalid proxy configuration".to_string())?;
     let client = reqwest::Client::builder()
         .proxy(proxy)
-        .timeout(Duration::from_secs(12))
+        .timeout(Duration::from_secs(10))
         .build()
         .map_err(|error| format!("creating proxy client: {}", error.without_url()))?;
+    let mut targets = vec![("Kilo Gateway".to_string(), KILO_BASE_URL.to_string())];
+    targets.extend(
+        configured_providers
+            .iter()
+            .filter(|provider| provider.id != "kilo")
+            .map(|provider| (provider.name.clone(), provider.base_url.clone())),
+    );
+    if configured_providers
+        .iter()
+        .all(|provider| provider.id != "openrouter")
+        && (env::var("OPENROUTER_API_KEY").is_ok() || env::var("NIO_OPENROUTER_API_KEY").is_ok())
+    {
+        targets.push(("OpenRouter".into(), OPENROUTER_BASE_URL.into()));
+    }
+    println!(
+        "Checking {} configured provider endpoint(s) without sending API keys...",
+        targets.len()
+    );
+    let results = futures_util::future::join_all(targets.iter().map(|(name, base_url)| {
+        let client = &client;
+        async move {
+            let result = probe_provider_models(client, base_url).await;
+            (name, result)
+        }
+    }))
+    .await;
+    for (name, result) in results {
+        match result {
+            Ok((status, _server))
+                if status.is_success() || status == reqwest::StatusCode::UNAUTHORIZED =>
+            {
+                println!("  {name}: reachable (HTTP {status})");
+            }
+            Ok((status, server)) => {
+                let server = server
+                    .map(|value| format!(", server: {value}"))
+                    .unwrap_or_default();
+                println!("  {name}: HTTP {status}{server}");
+            }
+            Err(error) => println!("  {name}: connection failed ({error})"),
+        }
+    }
+    println!(
+        "HTTP 401 usually means the endpoint is reachable; this check does not test provider authentication."
+    );
+    Ok(())
+}
+
+async fn probe_provider_models(
+    client: &reqwest::Client,
+    base_url: &str,
+) -> Result<(reqwest::StatusCode, Option<String>), String> {
     let response = client
-        .get("https://openrouter.ai/api/v1/models")
+        .get(endpoint(base_url, "models"))
         .send()
         .await
-        .map_err(|error| error.without_url().to_string())?;
-    Ok(response.status())
+        .map_err(|error| format!("{:?}", error.without_url()))?;
+    let server = response
+        .headers()
+        .get(reqwest::header::SERVER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    Ok((response.status(), server))
 }
 
 fn read_provider_key(prompt: &str) -> Result<String, String> {
