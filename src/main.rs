@@ -76,6 +76,7 @@ struct Options {
     reasoning: Option<String>,
     no_tools: bool,
     attachments: Vec<PathBuf>,
+    free_only: bool,
 }
 
 const EXIT_USAGE: u8 = 2;
@@ -659,6 +660,7 @@ fn default_options(command: &str) -> Options {
         reasoning: None,
         no_tools: false,
         attachments: Vec::new(),
+        free_only: false,
     }
 }
 
@@ -790,6 +792,7 @@ fn parse_args(args: Vec<String>) -> Result<Options, String> {
     let mut reasoning = None;
     let mut no_tools = false;
     let mut attachments = Vec::new();
+    let mut free_only = false;
 
     while let Some(arg) = args.next() {
         let (name, inline) = split_inline_flag(&arg);
@@ -806,6 +809,10 @@ fn parse_args(args: Vec<String>) -> Result<Options, String> {
             "--api-key" => api_key = Some(read_flag_value(&mut args, name, inline)?),
             "--all" | "--pure" => {
                 reject_flag_value(name, inline)?;
+            }
+            "--free" => {
+                reject_flag_value(name, inline)?;
+                free_only = true;
             }
             "--format" => {
                 let format = read_flag_value(&mut args, name, inline)?;
@@ -915,6 +922,7 @@ fn parse_args(args: Vec<String>) -> Result<Options, String> {
         reasoning,
         no_tools,
         attachments,
+        free_only,
     })
 }
 
@@ -1671,6 +1679,7 @@ fn indent_response_lines(text: &str, newline: &str) -> Vec<u8> {
 
 fn emit_tool_event(
     options: &Options,
+    step: usize,
     call: &AssistantToolCall,
     status: &str,
     input: &Value,
@@ -1679,8 +1688,13 @@ fn emit_tool_event(
     if !options.json_output {
         return;
     }
+    let call_id = if call.id.is_empty() {
+        format!("step{}-tool", step)
+    } else {
+        format!("{}-{}", step, call.id)
+    };
     emit_json(
-        &json!({"type":"tool_use","part":{"type":"tool","callID":call.id,"tool":call.name,"state":{"status":status,"input":input,"output":output,"title":format!("{} {}",call.name,tool_hint(&call.name,input))}}}),
+        &json!({"type":"tool_use","part":{"type":"tool","callID":call_id,"tool":call.name,"state":{"status":status,"input":input,"output":output,"title":format!("{} {}",call.name,tool_hint(&call.name,input))}}}),
     );
 }
 
@@ -2762,7 +2776,7 @@ async fn run_agent_turn_inner(
                 "exploring"
             };
             emit_status(options, status, &tool_label);
-            emit_tool_event(options, &call, "running", &input, None);
+            emit_tool_event(options, step, &call, "running", &input, None);
             let result = if !options.project_trusted {
                 Err("project folder is not trusted; project tools are disabled".to_string())
             } else if !mode_allows_changes(mode)
@@ -2780,7 +2794,7 @@ async fn run_agent_turn_inner(
             }
             let tool_status = if result.is_ok() { "completed" } else { "error" };
             let output = result.as_deref().unwrap_or_else(|error| error.as_str());
-            emit_tool_event(options, &call, tool_status, &input, Some(output));
+            emit_tool_event(options, step, &call, tool_status, &input, Some(output));
             let content = match result {
                 Ok(output) => output,
                 Err(error) => format!("Tool error: {error}"),
@@ -2798,7 +2812,10 @@ async fn run_agent_turn_inner(
 }
 
 async fn list_models(options: &Options) -> Result<(), String> {
-    let choices = fetch_model_choices(options).await?;
+    let mut choices = fetch_model_choices(options).await?;
+    if options.free_only {
+        choices.retain(|c| c.free);
+    }
     if options.json_output {
         emit_json(&json!(choices.iter().map(|c| json!({"id":c.selector(),"label":format!("{} · {}{}", c.name,c.gateway_label,if c.free { " (free)" } else { "" })})).collect::<Vec<_>>()));
         return Ok(());
@@ -2807,7 +2824,11 @@ async fn list_models(options: &Options) -> Result<(), String> {
         println!("No models found.");
         return Ok(());
     }
-    println!("Models · free first · {} available", choices.len());
+    if options.free_only {
+        println!("Models · free only · {} available", choices.len());
+    } else {
+        println!("Models · free first · {} available", choices.len());
+    }
     let terminal_width = terminal::size()
         .map(|(width, _)| width as usize)
         .unwrap_or(110)
@@ -4876,7 +4897,7 @@ fn rate_limit_retry_delay(
 const HELP_USAGE: &[(&str, &str)] = &[
     ("  nio [OPTIONS]", "Start the interactive prompt"),
     ("  nio run [OPTIONS] <prompt>", "Run one turn and print the reply"),
-    ("  nio models [--format json]", "List model selectors (free models first)"),
+    ("  nio models [--format json] [--free]", "List model selectors (free models first)"),
     ("  nio provider", "Configure a provider interactively"),
     (
         "  nio sessions [list|show <ID>|delete <ID>]",
@@ -5628,7 +5649,7 @@ fn print_help(topic: Option<&str>) -> Result<(), String> {
         }
         Some("models") => {
             println!("Usage:");
-            println!("  nio models [--format json]");
+            println!("  nio models [--format json] [--free]");
             println!();
             println!(
                 "List available model selectors, free models first. --format json\n\
