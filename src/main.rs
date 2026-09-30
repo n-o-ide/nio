@@ -3018,15 +3018,23 @@ fn choose_model_index_raw(
 }
 
 fn filtered_model_indices(choices: &[ModelChoice], query: &str) -> Vec<usize> {
-    let query = query.trim().to_lowercase();
+    let terms = query
+        .split_whitespace()
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>();
     choices
         .iter()
         .enumerate()
         .filter_map(|(index, choice)| {
-            let matches = query.is_empty()
-                || choice.name.to_lowercase().contains(&query)
-                || choice.gateway_label.to_lowercase().contains(&query)
-                || choice.selector().to_lowercase().contains(&query);
+            let name = choice.name.to_lowercase();
+            let gateway = choice.gateway_label.to_lowercase();
+            let selector = choice.selector().to_lowercase();
+            let matches = terms.iter().all(|term| {
+                (term == "free" && choice.free)
+                    || name.contains(term)
+                    || gateway.contains(term)
+                    || selector.contains(term)
+            });
             matches.then_some(index)
         })
         .collect()
