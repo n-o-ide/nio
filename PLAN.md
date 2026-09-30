@@ -1,7 +1,7 @@
 # NioAI Plan
 
-**Product:** NioAI  
-**Command:** `nio`  
+**Product:** NioAI
+**Command:** `nio`
 **Purpose:** A lightweight, standalone AI coding agent for terminals, including small Linux systems and Android/Termux. NoIDE is one optional client of NioAI, not a runtime requirement.
 
 ## Product principles
@@ -14,10 +14,9 @@
 
 ## Version 0.1: Standalone CLI foundation
 
-- **Status:** Initial implementation working; provider behavior still needs validation against real endpoints and free model tool-call support.
-- Provide `nio run`, `nio models`, and `nio --help`.
-- Let users select a model entry labeled with its gateway, then route by the model selector; use Kilo as the default catalog and add other catalogs when configured.
-- On the first interactive launch, require a model choice, save it as the default, then prompt for the user's first request. Allow `--model`/`NIO_MODEL` to select a model non-interactively.
+- **Status:** Complete. The CLI is functional: provider/model selection, project trust, streaming chat, tool calls, file/shell approvals, sessions, JSON output, proxy support, and basic error handling are implemented.
+- Provide `nio run`, `nio models`, `nio --help`, and `nio --version`.
+- On first interactive launch, require a model choice, save it as the default, then prompt for the user's first request. Allow `--model`/`NIO_MODEL` to select a model non-interactively.
 - Use OpenAI-compatible streaming chat completions with function/tool calls.
 - Allow anonymous calls only for documented free models on Kilo's public gateway.
 - Provide a small line-based interactive UI with progress updates and a persistent in-process conversation; avoid a full-screen TUI dependency in the lightweight core.
@@ -29,30 +28,38 @@
 
 The current implementation provides `nio`, `nio run`, `nio models`, `nio --help`, and `nio --version`. Running `nio` starts a lightweight line UI. The agent automatically gets project overview, list/search/read tools; writes and shell commands require approval by default. OpenAI-compatible model responses stream text and tool calls. `nio run --format json` emits NDJSON events (`reasoning`, `text`, and `tool_use`) that match NoIDE's current chat parser. The NoIDE UI does not yet list Nio as a selectable agent. Model listing shows free entries by default (`--all` includes paid entries), labels each model with its gateway, and supplies route-qualified selectors such as `kilo::provider/model`. First launch asks for a model and saves it in Nio's config. Kilo's public free routes support keyless use; OpenRouter is listed when its key is configured. Nio currently does not import credentials from OpenCode or provide account sign-in.
 
-## Version 0.2: Repository tools
+## Version 0.2: Robustness and shell safety
 
-- Respect `.gitignore` and repository guidance files throughout traversal.
-- Replace whole-file writes with patch proposals and show the diff before applying changes.
-- Add output limits, timeouts, cancellation, and clearer permissions for shell execution.
-- Improve large-repository discovery and context selection.
+- Add lightweight retry with jitter for transient provider/network errors, especially rate limits and timeouts.
+- Add token-aware context management so long sessions do not exceed model windows silently.
+- Replace `Result<T, String>` with small structured error types to distinguish auth failures, timeouts, tool errors, and provider issues.
+- Add a configurable HTTP request timeout in addition to the existing shell command timeout.
+- Add lightweight shell-safety checks for obviously destructive commands, with an explicit override path.
+- Add diff-style previews for file writes and show concise approval context.
 
-## Version 0.3: Modes and sessions
+## Version 0.3: Repository-aware editing
 
-- Add plan/read-only and build modes with clear permission boundaries.
-- Save conversations locally and resume them.
-- Add cancellation and predictable exit/error behavior.
+- Respect `.gitignore` and common generated/secret paths during automatic project discovery.
+- Add a lightweight patch/line-replace tool so the agent can make small edits without rewriting whole files.
+- Add optional Git context: `git status` and `git diff` summaries when the project is a repository.
+- Improve large-repository discovery with depth limits and skip rules.
 
-## Version 0.4: Provider routes
+## Version 0.4: Modes and sessions
 
-- Add presets for OpenRouter, Kilo, and other compatible endpoints.
-- Support model discovery where a route provides it.
-- Keep provider-specific request and error handling behind adapters.
-- Add fallback routing only after the single-provider flow is reliable.
+- Enforce read-only boundaries in Ask/Plan modes.
+- Improve session resume UX and conversation management.
+- Improve interruption and cancellation behavior with predictable exit codes.
 
-## Version 0.5: Integration interfaces
+## Version 0.5: Provider routes
 
-- Version and publish the NDJSON stream contract; add cancellation and NoIDE session integration.
-- Add an optional NoIDE adapter for prompts, model selection, attachments, streaming, and cancellation.
+- Maintain existing provider presets and add validation on provider save.
+- Add provider adapters for request/error handling and clearer failure messages.
+- Reserve fallback routing for later once single-provider flow is stable.
+
+## Version 0.6: Integration interfaces
+
+- Version and publish the NDJSON stream contract in `STREAM.md`.
+- Add cancellation and NoIDE session integration.
 - Keep NoIDE-specific behavior outside the core CLI.
 
 ## Version 1.0: Public release
