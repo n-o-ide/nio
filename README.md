@@ -19,13 +19,13 @@ The executable is at `target/release/nio`.
 
 ## Configure and run
 
-Running `nio` starts a lightweight, line-based coding agent. Before accessing a project folder, Nio asks whether to trust it. Trusted folders are remembered; choosing no trust keeps project context and agent tools disabled for that run. Untrusted non-interactive projects have no project access unless the host explicitly passes `--trust-project`. On first launch, Nio fetches available models, lists free models first, asks you to choose one, and saves it as the default. For trusted projects, Nio can list, search, and read files automatically. The agent asks before writing files or running shell commands. Kilo's public gateway provides keyless access to its free routes:
+Running `nio` starts a lightweight, line-based coding agent. Before accessing a project folder, Nio asks whether to trust it. Trusted folders are remembered; choosing no trust keeps project context and agent tools disabled for that run. Untrusted non-interactive projects have no project access unless the host explicitly passes `--trust-project`. In an interactive TTY, Nio still asks whether to trust the project folder when it first needs access. On first launch, Nio fetches available models, lists free models first, asks you to choose one, and saves it as the default. For trusted projects, Nio can list, search, and read files automatically. The agent asks before writing files or running shell commands. Kilo's public gateway provides keyless access to its free routes:
 
 ```sh
 nio
 ```
 
-Use `:clear` to clear the interactive conversation, `:diff` to review git changes, `:undo` to revert file mutations made by Nio, and `:quit` to exit. File tools stay inside the current directory. Automatic listing/search skips common generated folders, secret filenames, and paths matched by `.gitignore`; individual file reads and writes are limited to 512 KiB. Each search reads at most 16 MiB and returns at most 50 matches. Ignore parsing is bounded to 256 KiB across the scan.
+Use `:clear` to clear the interactive conversation, `:diff` to review git changes, `:undo` to revert file mutations made by Nio, and `:quit` to exit. File tools stay inside the current directory. Automatic listing/search skips common generated folders, secret filenames, and paths matched by `.gitignore`; individual file reads and writes are limited to 512 KiB. Each search reads at most 16 MiB and returns at most 50 entries. Ignore parsing is bounded to 256 KiB across the scan.
 
 To see the model catalog at any time, run `nio models`. Free models appear first when the provider reports free status or zero pricing. Each choice shows its model name and gateway; Nio routes requests through the selected gateway automatically. You can override the saved model with `-m`:
 
@@ -42,7 +42,7 @@ nio models
 nio run -m aihubmix::provider/model "Summarize this repository"
 ```
 
-In the interactive CLI, enter `:bash` or `:command` to switch to a direct shell prompt in the project directory; enter `:ai` to return to Nio.
+In the interactive CLI, enter `:bash` or `:command` to switch to a direct shell prompt in the project directory; enter `:ai` to return to Nio. `:` and `/` both work for interactive commands; for example, `:approval` and `/approval`, or `:setting` and `/setting`, are equivalent.
 
 Shell commands use `sh` on Unix-like systems and `cmd.exe` on Windows. Command execution uses bounded capture, a 120-second timeout, and clean process group termination on cancellation.
 
@@ -50,9 +50,11 @@ Enter `:path` (alias `:workingpath`) to show the current project directory. Ente
 
 Use `:proxy` to route all model API requests through an HTTP or HTTPS proxy, or set `NIO_PROXY` to override the saved proxy. Its local presets are Tinyproxy at `http://127.0.0.1:8888` and Squid at `http://127.0.0.1:3128`; install and start the selected service first. The connectivity check probes Kilo and each configured provider's `/models` endpoint without sending API keys. Use a standard HTTP(S) proxy that supports CONNECT tunnels for HTTPS traffic; a CORS relay is not a general-purpose API proxy. Use only a proxy you own or are authorized to use; public proxies can observe prompts and authorization headers. Nio does not bundle or recommend a free public proxy.
 
-In the interactive CLI, use `:mode` to choose Ask, Plan, or Build. Ask answers questions and can inspect files without changing them; Plan inspects the project and returns a plan; Build can edit files and run commands after approval. Approval prompts are on by default. Use `:approval` or `:setting` to toggle automatic approval for file writes and shell commands; this preference persists in Nio's user config. The `--auto` flag enables automatic approval for a single `nio run` invocation. Use `:reasoning` or `:setting` to set reasoning effort to low, medium, high, or the provider default.
+In the interactive CLI, use `:mode` to choose Ask, Plan, or Build. Ask answers questions and can inspect files without changing them; Plan inspects the project and returns a plan; Build can edit files and run commands after approval. Approval prompts are on by default. Use `:approval` or `:setting` to toggle automatic approval for file writes and shell commands; this preference persists in Nio's user config. The `--auto` flag enables automatic approval for a single `nio run` invocation. Use `:reasoning` or `:setting` to set reasoning effort to low, medium, high, or the provider default. Use `:theme` to preview and select a persistent terminal palette: Default, Ocean, Forest, Sunset, Dracula, Nord, Solarized, or Monokai. The same choice is available in `:setting` and via `nio config get/set theme`.
 
 Model catalogs include all available models, with free models listed first when the provider reports pricing or free status. Use `nio models` to see the catalog; in `:model`, press Left/Right to page through 25 choices and Up/Down to move between choices. Provider IDs appear as the left side of a selector, for example `openrouter::provider/model`. Provider access, free models, and quotas depend on the provider and may change. API keys saved through `:provider` are kept in Nio's user config; on Unix, the config file is restricted to the current user. Avoid putting API keys directly in shell history.
+
+Interactive model selection pages through 25 entries at a time; use Left/Right to page and Up/Down to move between entries. Search results also paginate at 25 entries.
 
 If OpenRouter models fail to load, check that your network allows HTTPS access to `openrouter.ai`. A network filter may return an HTTP 403 block page or interrupt TLS before Nio can reach the API; an API key cannot bypass that network block.
 

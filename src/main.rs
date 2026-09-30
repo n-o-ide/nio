@@ -137,9 +137,9 @@ impl CliError {
 
     fn message(&self) -> &str {
         match self {
-            CliError::Usage(message) | CliError::Cancelled(message) | CliError::Runtime(message) => {
-                message
-            }
+            CliError::Usage(message)
+            | CliError::Cancelled(message)
+            | CliError::Runtime(message) => message,
         }
     }
 }
@@ -508,6 +508,8 @@ struct UserConfig {
     #[serde(default)]
     progress_style: Option<String>,
     #[serde(default)]
+    theme: Option<String>,
+    #[serde(default)]
     prompt_history: Vec<String>,
     #[serde(default)]
     proxy_url: Option<String>,
@@ -515,6 +517,92 @@ struct UserConfig {
     providers: Vec<ProviderConfig>,
     #[serde(default)]
     trusted_folders: Vec<PathBuf>,
+}
+
+#[derive(Clone, Copy)]
+struct ThemePalette {
+    id: &'static str,
+    name: &'static str,
+    accent: u8,
+    success: u8,
+    warning: u8,
+    muted: u8,
+}
+
+const THEMES: [ThemePalette; 8] = [
+    ThemePalette {
+        id: "default",
+        name: "Default",
+        accent: 36,
+        success: 32,
+        warning: 33,
+        muted: 244,
+    },
+    ThemePalette {
+        id: "ocean",
+        name: "Ocean",
+        accent: 39,
+        success: 46,
+        warning: 220,
+        muted: 245,
+    },
+    ThemePalette {
+        id: "forest",
+        name: "Forest",
+        accent: 82,
+        success: 118,
+        warning: 220,
+        muted: 242,
+    },
+    ThemePalette {
+        id: "sunset",
+        name: "Sunset",
+        accent: 213,
+        success: 208,
+        warning: 221,
+        muted: 245,
+    },
+    ThemePalette {
+        id: "dracula",
+        name: "Dracula",
+        accent: 141,
+        success: 84,
+        warning: 228,
+        muted: 245,
+    },
+    ThemePalette {
+        id: "nord",
+        name: "Nord",
+        accent: 110,
+        success: 108,
+        warning: 179,
+        muted: 245,
+    },
+    ThemePalette {
+        id: "solarized",
+        name: "Solarized",
+        accent: 33,
+        success: 64,
+        warning: 136,
+        muted: 244,
+    },
+    ThemePalette {
+        id: "monokai",
+        name: "Monokai",
+        accent: 197,
+        success: 148,
+        warning: 208,
+        muted: 245,
+    },
+];
+
+fn configured_theme(config: &UserConfig) -> ThemePalette {
+    let id = config.theme.as_deref().unwrap_or("default");
+    THEMES
+        .iter()
+        .copied()
+        .find(|theme| theme.id == id)
+        .unwrap_or(THEMES[0])
 }
 
 fn configured_progress_style(config: &UserConfig) -> &str {
@@ -1440,9 +1528,9 @@ fn highlight_code_line(line: &str) -> String {
         return format!("\x1b[38;5;244m{line}\x1b[0m");
     }
     let keywords = [
-        "fn", "pub", "struct", "enum", "impl", "let", "mut", "if", "else", "match",
-        "return", "async", "await", "import", "def", "class", "from", "const",
-        "function", "var", "use", "mod", "type", "for", "while", "in", "as", "true", "false",
+        "fn", "pub", "struct", "enum", "impl", "let", "mut", "if", "else", "match", "return",
+        "async", "await", "import", "def", "class", "from", "const", "function", "var", "use",
+        "mod", "type", "for", "while", "in", "as", "true", "false",
     ];
     let mut result = String::with_capacity(line.len() * 2);
     let mut chars = line.chars().peekable();
@@ -1459,7 +1547,8 @@ fn highlight_code_line(line: &str) -> String {
                     break;
                 }
                 if c == '\\'
-                    && let Some(&escaped) = chars.peek() {
+                    && let Some(&escaped) = chars.peek()
+                {
                     chars.next();
                     result.push(escaped);
                 }
@@ -1592,7 +1681,9 @@ impl MarkdownFormatter {
                     if full_line.trim_start().starts_with("```") {
                         self.in_code_block = false;
                         self.at_line_start = true;
-                        output.push_str("\x1b[38;5;244m└──────────────────────────────────────────\x1b[0m\r\n");
+                        output.push_str(
+                            "\x1b[38;5;244m└──────────────────────────────────────────\x1b[0m\r\n",
+                        );
                     } else {
                         output.push_str(&format!(
                             "\x1b[38;5;244m│\x1b[0m {}\r\n",
@@ -1606,7 +1697,9 @@ impl MarkdownFormatter {
                     let full_line = std::mem::take(&mut self.code_line_buffer);
                     if full_line.trim_start().starts_with("```") {
                         self.in_code_block = false;
-                        output.push_str("\x1b[38;5;244m└──────────────────────────────────────────\x1b[0m\r\n");
+                        output.push_str(
+                            "\x1b[38;5;244m└──────────────────────────────────────────\x1b[0m\r\n",
+                        );
                     } else {
                         output.push_str(&format!(
                             "\x1b[38;5;244m│\x1b[0m {}\r\n",
@@ -1623,10 +1716,7 @@ impl MarkdownFormatter {
             if self.at_line_start && self.pending.starts_with("```") {
                 if let Some(newline_pos) = self.pending.find('\n') {
                     let header_line = self.pending.drain(..=newline_pos).collect::<String>();
-                    let lang = header_line
-                        .trim_start_matches('`')
-                        .trim()
-                        .to_string();
+                    let lang = header_line.trim_start_matches('`').trim().to_string();
                     let lang_tag = if lang.is_empty() { "code" } else { &lang };
                     self.in_code_block = true;
                     output.push_str(&format!(
@@ -1639,7 +1729,10 @@ impl MarkdownFormatter {
             }
 
             if self.at_line_start {
-                if !flush_partial && self.pending.chars().all(|c| c == '#') && self.pending.len() <= 6 {
+                if !flush_partial
+                    && self.pending.chars().all(|c| c == '#')
+                    && self.pending.len() <= 6
+                {
                     break;
                 }
 
@@ -1701,8 +1794,10 @@ impl MarkdownFormatter {
                     self.at_line_start = false;
                     continue;
                 }
-                if after_spaces.starts_with("- [x] ") || after_spaces.starts_with("- [X] ")
-                    || after_spaces.starts_with("* [x] ") || after_spaces.starts_with("* [X] ")
+                if after_spaces.starts_with("- [x] ")
+                    || after_spaces.starts_with("- [X] ")
+                    || after_spaces.starts_with("* [x] ")
+                    || after_spaces.starts_with("* [X] ")
                 {
                     self.pending.drain(..spaces + 6);
                     let indent = " ".repeat(spaces);
@@ -1726,7 +1821,10 @@ impl MarkdownFormatter {
                     continue;
                 }
 
-                let digits = after_spaces.chars().take_while(|c| c.is_ascii_digit()).count();
+                let digits = after_spaces
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .count();
                 if digits > 0 && after_spaces[digits..].starts_with(". ") {
                     let num = after_spaces[..digits].to_string();
                     let drain_len = spaces + digits + 2;
@@ -1820,7 +1918,6 @@ fn terminal_character_width(character: char) -> usize {
         1
     }
 }
-
 
 fn compact_tool_messages(messages: &mut [Value]) {
     for message in messages {
@@ -2263,18 +2360,19 @@ async fn execute_agent_tool(
             if patched_text.len() > 512 * 1024 {
                 return Err("patched file content is larger than the 512 KiB write limit".into());
             }
+            let display_path = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            let summary = preview_summary(&display_path, old_content.as_bytes(), new_content);
+            let details =
+                preview_replacement(&display_path, &original_text, old_content, new_content);
             if !interrupt.with_terminal_input(|| {
-                if !auto_approve {
-                    eprintln!("{}", preview(&original_bytes, &patched_text));
-                }
                 confirm_tool(
                     auto_approve,
-                    &format!(
-                        "Patch {} (replacing {} bytes with {} bytes)",
-                        path.display(),
-                        old_content.len(),
-                        new_content.len()
-                    ),
+                    &format!("Patch {display_path}"),
+                    Some((&summary, &details)),
                 )
             })? {
                 return Err("user denied file patch".into());
@@ -2310,16 +2408,19 @@ async fn execute_agent_tool(
                 return Err("file is excluded from automatic project access".into());
             }
             let original = optional_read(&path, FILE_LIMIT)?;
+            let display_path = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            let old_bytes = original.as_deref().unwrap_or_default();
+            let summary = preview_summary(&display_path, old_bytes, content);
+            let details = preview_for_path(&display_path, old_bytes, content);
             if !interrupt.with_terminal_input(|| {
-                if !auto_approve {
-                    eprintln!(
-                        "{}",
-                        preview(original.as_deref().unwrap_or_default(), content)
-                    );
-                }
                 confirm_tool(
                     auto_approve,
-                    &format!("Write {} ({} bytes)", path.display(), content.len()),
+                    &format!("Write {display_path}"),
+                    Some((&summary, &details)),
                 )
             })? {
                 return Err("user denied file write".into());
@@ -2340,7 +2441,10 @@ async fn execute_agent_tool(
             let mut cmd = tokio::process::Command::new("git");
             cmd.arg("status").arg("--short").current_dir(root);
             cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-            let output = cmd.output().await.map_err(|e| format!("running git status: {e}"))?;
+            let output = cmd
+                .output()
+                .await
+                .map_err(|e| format!("running git status: {e}"))?;
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 return Ok(format!("Not a git repository or git error: {stderr}"));
@@ -2363,7 +2467,10 @@ async fn execute_agent_tool(
             }
             cmd.current_dir(root);
             cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-            let output = cmd.output().await.map_err(|e| format!("running git diff: {e}"))?;
+            let output = cmd
+                .output()
+                .await
+                .map_err(|e| format!("running git diff: {e}"))?;
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 return Ok(format!("Not a git repository or git error: {stderr}"));
@@ -2388,7 +2495,7 @@ async fn execute_agent_tool(
         "run_command" => {
             let command = required_arg(args, "command")?;
             if !interrupt.with_terminal_input(|| {
-                confirm_tool(auto_approve, &format!("Run command: {command}"))
+                confirm_tool(auto_approve, &format!("Run command: {command}"), None)
             })? {
                 return Err("user denied command".into());
             }
@@ -2541,108 +2648,114 @@ fn is_excluded_project_path(root: &Path, path: &Path) -> bool {
     })
 }
 
-fn confirm_tool(auto_approve: bool, action: &str) -> Result<bool, String> {
+fn confirm_tool(
+    auto_approve: bool,
+    action: &str,
+    preview: Option<(&str, &str)>,
+) -> Result<bool, String> {
     if auto_approve {
         return Ok(true);
     }
-    if !io::stdin().is_terminal() {
+    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
         return Ok(false);
     }
-    loop {
+    let mut guard =
+        RawModeGuard::acquire().map_err(|error| format!("enabling approval selector: {error}"))?;
+    let width = terminal::size()
+        .map(|(width, _)| width as usize)
+        .unwrap_or(80);
+    let action = truncate(action, width.saturating_sub(64).max(8));
+    let mut selected_yes = false;
+    let mut details_visible = false;
+    let mut rendered_rows = 0usize;
+    let draw = |selected_yes: bool,
+                details_visible: bool,
+                previous_rows: usize|
+     -> Result<usize, String> {
+        if previous_rows == 0 {
+            eprint!("\r\n");
+        } else {
+            eprint!("\x1b[{}A\r\x1b[J", previous_rows.saturating_sub(1));
+        }
+        let mut rows = 0usize;
+        if let Some((summary, details)) = preview {
+            let summary = truncate(summary, width.saturating_sub(22).max(10));
+            eprint!("\x1b[1;38;5;244m●\x1b[0m {summary}");
+            if details_visible {
+                eprint!("  \x1b[2m− Hide details [d]\x1b[0m");
+            } else {
+                eprint!("  \x1b[2m+ Show details [d]\x1b[0m");
+            }
+            eprint!("\r\n");
+            rows += 1;
+            if details_visible {
+                let details_crlf = details.replace('\n', "\r\n");
+                eprint!("{details_crlf}");
+                rows += details.lines().count();
+            }
+        }
+        let yes = if selected_yes {
+            "\x1b[1;30;42m Yes \x1b[0m"
+        } else {
+            "\x1b[2;37m Yes \x1b[0m"
+        };
+        let no = if selected_yes {
+            "\x1b[2;37m No \x1b[0m"
+        } else {
+            "\x1b[1;37;41m No \x1b[0m"
+        };
         eprint!(
-            "\nApprove {action}? [y/N; :approval or /approval enables auto-approve; Ctrl+C exits] "
+            "\x1b[1;37mApprove\x1b[0m {action}   {yes}  {no}  \x1b[2m←/→ · Enter · y/n · d details · a auto\x1b[0m"
         );
         io::stderr()
             .flush()
-            .map_err(|error| format!("writing approval prompt: {error}"))?;
-        let Some(answer) = read_approval_line()? else {
-            CTRL_C_COUNT.store(2, Ordering::SeqCst);
-            return Err(TURN_INTERRUPTED.into());
-        };
-        match answer.trim().to_ascii_lowercase().as_str() {
-            "y" | "yes" => return Ok(true),
-            "" | "n" | "no" => return Ok(false),
-            command => {
-                let command = command
-                    .strip_prefix(':')
-                    .or_else(|| command.strip_prefix('/'));
-                match command {
-                    Some("approval") => {
-                        toggle_auto_approval()?;
-                        if load_user_config()?.auto_approve_actions.unwrap_or(false) {
-                            return Ok(true);
-                        }
-                    }
-                    Some("setting" | "settings") => configure_settings()?,
-                    Some("help") => {
-                        eprintln!("Commands: :approval (or /approval), :setting (or /setting)");
-                    }
-                    _ => eprintln!("Enter y or n, or use :approval / :setting (slash also works)."),
-                }
-            }
+            .map_err(|error| format!("drawing approval selector: {error}"))?;
+        Ok(rows + 1)
+    };
+    rendered_rows = draw(selected_yes, details_visible, rendered_rows)?;
+    let result = loop {
+        let event = event::read().map_err(|error| format!("reading approval choice: {error}"))?;
+        let Event::Key(key) = event else { continue };
+        if key.kind == KeyEventKind::Release {
+            continue;
         }
-    }
-}
-
-fn read_approval_line() -> Result<Option<String>, String> {
-    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
-        let mut answer = String::new();
-        io::stdin()
-            .read_line(&mut answer)
-            .map_err(|error| format!("reading approval: {error}"))?;
-        return Ok(Some(answer));
-    }
-
-    let mut guard = RawModeGuard::acquire().map_err(|error| format!("enabling approval input: {error}"))?;
-    let result = (|| {
-        let mut answer = String::new();
-        loop {
-            let event = event::read().map_err(|error| format!("reading approval: {error}"))?;
-            let Event::Key(key) = event else { continue };
-            if key.kind == KeyEventKind::Release {
-                continue;
+        match key.code {
+            KeyCode::Enter => break Ok(selected_yes),
+            KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down => {
+                selected_yes = !selected_yes;
+                rendered_rows = draw(selected_yes, details_visible, rendered_rows)?;
             }
-            match key.code {
-                KeyCode::Enter => {
-                    eprint!("\r\n");
-                    io::stderr()
-                        .flush()
-                        .map_err(|error| format!("finishing approval input: {error}"))?;
-                    return Ok(Some(answer));
+            KeyCode::Char('y' | 'Y') => break Ok(true),
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => break Ok(false),
+            KeyCode::Char('a' | 'A') => {
+                eprint!("\x1b[{}A\r\x1b[J", rendered_rows.saturating_sub(1));
+                let _ = io::stderr().flush();
+                rendered_rows = 0;
+                guard.release();
+                toggle_auto_approval()?;
+                if load_user_config()?.auto_approve_actions.unwrap_or(false) {
+                    break Ok(true);
                 }
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    eprint!("^C\r\n");
-                    io::stderr()
-                        .flush()
-                        .map_err(|error| format!("showing approval interrupt: {error}"))?;
-                    return Ok(None);
-                }
-                KeyCode::Esc => {
-                    eprint!("\r\n");
-                    return Ok(Some(String::new()));
-                }
-                KeyCode::Backspace => {
-                    if answer.pop().is_some() {
-                        eprint!("\x08 \x08");
-                        io::stderr()
-                            .flush()
-                            .map_err(|error| format!("updating approval input: {error}"))?;
-                    }
-                }
-                KeyCode::Char(character)
-                    if !key.modifiers.contains(KeyModifiers::CONTROL)
-                        && !key.modifiers.contains(KeyModifiers::ALT) =>
-                {
-                    answer.push(character);
-                    eprint!("{character}");
-                    io::stderr()
-                        .flush()
-                        .map_err(|error| format!("updating approval input: {error}"))?;
-                }
-                _ => {}
+                guard = RawModeGuard::acquire()
+                    .map_err(|error| format!("enabling approval selector: {error}"))?;
+                rendered_rows = 0;
+                rendered_rows = draw(selected_yes, details_visible, rendered_rows)?;
             }
+            KeyCode::Char('d' | 'D') if preview.is_some() => {
+                details_visible = !details_visible;
+                rendered_rows = draw(selected_yes, details_visible, rendered_rows)?;
+            }
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                CTRL_C_COUNT.store(2, Ordering::SeqCst);
+                break Err(TURN_INTERRUPTED.to_string());
+            }
+            _ => {}
         }
-    })();
+    };
+    if rendered_rows > 0 {
+        let _ = eprint!("\x1b[{}A\r\x1b[J\r\n", rendered_rows.saturating_sub(1));
+    }
+    let _ = io::stderr().flush();
     guard.release();
     result
 }
@@ -2953,7 +3066,11 @@ async fn run_agent_turn_inner(
         if options.json_output {
             emit_status(options, "exploring", "Scanning project files");
         } else if progress_style == "inline" {
-            let newline = if RAW_TTY_MODE.load(Ordering::SeqCst) { "\r\n" } else { "\n" };
+            let newline = if RAW_TTY_MODE.load(Ordering::SeqCst) {
+                "\r\n"
+            } else {
+                "\n"
+            };
             eprint!("\x1b[32m✔\x1b[0m Scanning project files{newline}");
             let _ = io::stderr().flush();
         } else {
@@ -3262,7 +3379,9 @@ async fn run_agent_turn_inner(
                     "\n"
                 };
                 let total_secs = turn_start.elapsed().as_secs_f32();
-                eprint!("{newline}\x1b[32m✔\x1b[0m Finished \x1b[2m({total_secs:.1}s)\x1b[0m{newline}");
+                eprint!(
+                    "{newline}\x1b[32m✔\x1b[0m Finished \x1b[2m({total_secs:.1}s)\x1b[0m{newline}"
+                );
                 let _ = io::stderr().flush();
             }
             let assistant = json!({"role":"assistant", "content":answer});
@@ -3286,12 +3405,11 @@ async fn run_agent_turn_inner(
             let input = call.arguments.clone();
             let tool_hint_str = tool_hint(&call.name, &input);
             let tool_label = format!("{} {}", call.name, tool_hint_str);
-            let is_mutating = matches!(call.name.as_str(), "write_file" | "patch_file" | "run_command");
-            let status = if is_mutating {
-                "working"
-            } else {
-                "exploring"
-            };
+            let is_mutating = matches!(
+                call.name.as_str(),
+                "write_file" | "patch_file" | "run_command"
+            );
+            let status = if is_mutating { "working" } else { "exploring" };
             if options.json_output {
                 emit_status(options, status, &tool_label);
             }
@@ -3316,7 +3434,9 @@ async fn run_agent_turn_inner(
                 };
                 if progress_style == "compact" && !is_mutating {
                     explored_count += 1;
-                    eprint!("\r\x1b[2K\x1b[36m⠋\x1b[0m Exploring project \x1b[2m({explored_count} files inspected: {tool_label})\x1b[0m");
+                    eprint!(
+                        "\r\x1b[2K\x1b[36m⠋\x1b[0m Exploring project \x1b[2m({explored_count} files inspected: {tool_label})\x1b[0m"
+                    );
                     let _ = io::stderr().flush();
                 } else {
                     if progress_style == "compact" {
@@ -3590,21 +3710,22 @@ fn choices_from_catalog(models: Vec<ModelInfo>, gateway: &str, label: &str) -> V
 }
 
 fn render_status_bar(config: &UserConfig, root: &Path, history: &[Value], model: &str) -> String {
+    let theme = configured_theme(config);
     let mode = configured_agent_mode(config);
     let mode_badge = match mode {
-        "build" => "\x1b[1;32m[BUILD]\x1b[0m",
-        "plan" => "\x1b[1;34m[PLAN]\x1b[0m",
-        _ => "\x1b[1;35m[ASK]\x1b[0m",
+        "build" => format!("\x1b[1;38;5;{}m[BUILD]\x1b[0m", theme.success),
+        "plan" => format!("\x1b[1;38;5;{}m[PLAN]\x1b[0m", theme.accent),
+        _ => format!("\x1b[1;38;5;{}m[ASK]\x1b[0m", theme.accent),
     };
     let model_short = model.split("::").last().unwrap_or(model);
-    let model_badge = format!("\x1b[2m{model_short}\x1b[0m");
+    let model_badge = format!("\x1b[38;5;{}m{model_short}\x1b[0m", theme.muted);
 
     let history_bytes: usize = serde_json::to_vec(history).map(|v| v.len()).unwrap_or(0);
     let pct = (history_bytes * 100) / (CONTEXT_LIMIT.max(1));
     let ctx_badge = if pct > 75 {
-        format!("\x1b[33mctx:{pct}%\x1b[0m")
+        format!("\x1b[38;5;{}mctx:{pct}%\x1b[0m", theme.warning)
     } else {
-        format!("\x1b[2mctx:{pct}%\x1b[0m")
+        format!("\x1b[38;5;{}mctx:{pct}%\x1b[0m", theme.muted)
     };
 
     let git_badge = {
@@ -3614,7 +3735,7 @@ fn render_status_bar(config: &UserConfig, root: &Path, history: &[Value], model:
             if out.status.success() {
                 let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if !branch.is_empty() {
-                    format!(" \x1b[36mgit:({branch})\x1b[0m")
+                    format!(" \x1b[38;5;{}mgit:({branch})\x1b[0m", theme.accent)
                 } else {
                     String::new()
                 }
@@ -3643,20 +3764,25 @@ async fn interactive(options: Options) -> Result<(), String> {
         prompt_history.drain(..prompt_history.len() - 100);
     }
     ensure_cooked_mode();
-    print_session_header(&model, &session_id)?;
+    print_session_header(&model, &session_id, &load_user_config()?)?;
     let mut stdout = io::stdout().lock();
     if options.project_trusted {
         write!(stdout, "Project tools are available automatically.")
             .map_err(|e| format!("writing project access status: {e}"))?;
     } else {
-        write!(stdout, "Project tools are disabled because this folder is not trusted.")
-            .map_err(|e| format!("writing project access status: {e}"))?;
+        write!(
+            stdout,
+            "Project tools are disabled because this folder is not trusted."
+        )
+        .map_err(|e| format!("writing project access status: {e}"))?;
     }
     write_terminal_newline(&mut stdout)?;
     write!(stdout, "Type : or / for commands; :help for help.")
         .map_err(|e| format!("writing command hint: {e}"))?;
     write_terminal_newline(&mut stdout)?;
-    stdout.flush().map_err(|e| format!("flushing startup text: {e}"))?;
+    stdout
+        .flush()
+        .map_err(|e| format!("flushing startup text: {e}"))?;
     drop(stdout);
     print_prompt_divider()?;
 
@@ -3672,7 +3798,12 @@ async fn interactive(options: Options) -> Result<(), String> {
             None
         };
         let prompt = if command_mode { "$ " } else { "🤖 nio> " };
-        let line = match read_interactive_line(prompt, &prompt_history, &visible_followups, status_bar_info)? {
+        let line = match read_interactive_line(
+            prompt,
+            &prompt_history,
+            &visible_followups,
+            status_bar_info,
+        )? {
             PromptInput::Line(line) => {
                 CTRL_C_COUNT.store(0, Ordering::SeqCst);
                 let entry = line.trim();
@@ -3708,7 +3839,7 @@ async fn interactive(options: Options) -> Result<(), String> {
         }
         if input == ":help" {
             println!(
-                "Commands: :clear, :diff, :undo, :help, :model, :mode, :approval, :reasoning, :provider, :proxy, :path, :setting, :bash, :ai, :quit (use : or /)"
+                "Commands: :clear, :diff, :undo, :help, :model, :mode, :approval, :reasoning, :theme, :provider, :proxy, :path, :setting, :bash, :ai, :quit (use : or /)"
             );
             continue;
         }
@@ -3781,6 +3912,12 @@ async fn interactive(options: Options) -> Result<(), String> {
             configure_reasoning_effort()?;
             continue;
         }
+        if !command_mode && input == ":theme" {
+            if let Err(error) = configure_theme() {
+                eprintln!("nio: {error}");
+            }
+            continue;
+        }
         if !command_mode && input == ":provider" {
             configure_provider().await?;
             continue;
@@ -3805,7 +3942,7 @@ async fn interactive(options: Options) -> Result<(), String> {
                 MoveTo(0, 0)
             )
             .map_err(|error| format!("clearing terminal: {error}"))?;
-            print_session_header(&model, &session_id)?;
+            print_session_header(&model, &session_id, &load_user_config()?)?;
             println!("Conversation history cleared.");
             print_prompt_divider()?;
             continue;
@@ -3857,7 +3994,7 @@ async fn interactive(options: Options) -> Result<(), String> {
             Clear(ClearType::All),
             MoveTo(0, 0)
         )
-            .map_err(|error| format!("clearing terminal on exit: {error}"))?;
+        .map_err(|error| format!("clearing terminal on exit: {error}"))?;
         writeln!(
             stdout,
             "Session saved. Resume with: nio --session {}",
@@ -3871,8 +4008,8 @@ async fn interactive(options: Options) -> Result<(), String> {
     Ok(())
 }
 
-fn print_session_header(model: &str, session_id: &str) -> Result<(), String> {
-    let config = load_user_config()?;
+fn print_session_header(model: &str, session_id: &str, config: &UserConfig) -> Result<(), String> {
+    let theme = configured_theme(config);
     let mode = configured_agent_mode(&config);
     let effort = config
         .reasoning_effort
@@ -3881,15 +4018,15 @@ fn print_session_header(model: &str, session_id: &str) -> Result<(), String> {
     print_prompt_divider()?;
     let mut stdout = io::stdout().lock();
     write!(stdout, "🤖 NioAI · model ").map_err(|e| format!("writing session header: {e}"))?;
-    write_header_value(&mut stdout, model)?;
+    write_header_value(&mut stdout, model, theme)?;
     write_terminal_newline(&mut stdout)?;
     write!(stdout, "Session ID: ").map_err(|e| format!("writing session header: {e}"))?;
-    write_header_value(&mut stdout, session_id)?;
+    write_header_value(&mut stdout, session_id, theme)?;
     write_terminal_newline(&mut stdout)?;
     write!(stdout, "Mode: ").map_err(|e| format!("writing session header: {e}"))?;
-    write_header_value(&mut stdout, &title_case(mode))?;
+    write_header_value(&mut stdout, &title_case(mode), theme)?;
     write!(stdout, " · Reasoning: ").map_err(|e| format!("writing session header: {e}"))?;
-    write_header_value(&mut stdout, &title_case(effort))?;
+    write_header_value(&mut stdout, &title_case(effort), theme)?;
     write_terminal_newline(&mut stdout)?;
     write!(stdout, "Approval: ").map_err(|e| format!("writing session header: {e}"))?;
     write_header_value(
@@ -3899,27 +4036,33 @@ fn print_session_header(model: &str, session_id: &str) -> Result<(), String> {
         } else {
             "Ask before writes and commands"
         },
+        theme,
     )?;
     write_terminal_newline(&mut stdout)?;
-    stdout.flush().map_err(|e| format!("flushing session header: {e}"))?;
+    stdout
+        .flush()
+        .map_err(|e| format!("flushing session header: {e}"))?;
     Ok(())
 }
 
 fn write_terminal_newline(stdout: &mut impl Write) -> Result<(), String> {
     if io::stdout().is_terminal() {
-        queue!(stdout, MoveToNextLine(1))
-            .map_err(|e| format!("advancing terminal output: {e}"))?;
+        queue!(stdout, MoveToNextLine(1)).map_err(|e| format!("advancing terminal output: {e}"))?;
     } else {
         writeln!(stdout).map_err(|e| format!("writing line ending: {e}"))?;
     }
     Ok(())
 }
 
-fn write_header_value(stdout: &mut impl Write, value: &str) -> Result<(), String> {
+fn write_header_value(
+    stdout: &mut impl Write,
+    value: &str,
+    theme: ThemePalette,
+) -> Result<(), String> {
     if io::stdout().is_terminal() {
         queue!(
             stdout,
-            SetForegroundColor(Color::Cyan),
+            SetForegroundColor(Color::AnsiValue(theme.accent)),
             SetAttribute(Attribute::Bold)
         )
         .map_err(|e| format!("styling session header: {e}"))?;
@@ -3949,7 +4092,7 @@ fn print_prompt_divider() -> Result<(), String> {
         .map_err(|error| format!("writing prompt divider: {error}"))
 }
 
-const COMMANDS: [(&str, &str); 14] = [
+const COMMANDS: [(&str, &str); 15] = [
     (":clear", "Clear conversation history"),
     (":diff", "Show git diff of project changes"),
     (":undo", "Revert last file change made by Nio"),
@@ -3964,6 +4107,7 @@ const COMMANDS: [(&str, &str); 14] = [
     (":proxy", "Route provider requests through a proxy"),
     (":path", "Show the current project directory"),
     (":reasoning", "Set reasoning effort"),
+    (":theme", "Choose the terminal color theme"),
     (":bash", "Switch to a direct shell prompt"),
     (
         ":setting",
@@ -4103,7 +4247,8 @@ fn read_interactive_line(
         };
     }
 
-    let mut guard = RawModeGuard::acquire().map_err(|e| format!("enabling interactive input: {e}"))?;
+    let mut guard =
+        RawModeGuard::acquire().map_err(|e| format!("enabling interactive input: {e}"))?;
     let _ = execute!(io::stdout(), EnableBracketedPaste);
     let result = read_interactive_line_raw(prompt, history, suggestions, status_bar_info);
     let _ = execute!(io::stdout(), DisableBracketedPaste);
@@ -4119,9 +4264,14 @@ fn draw_search(
     queue!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))
         .map_err(|e| format!("updating search: {e}"))?;
     let match_text = matched.as_deref().unwrap_or("");
-    write!(stdout, "(reverse-i-search)`\x1b[36m{query}\x1b[0m': {match_text}")
-        .map_err(|e| format!("writing search: {e}"))?;
-    stdout.flush().map_err(|e| format!("flushing search: {e}"))?;
+    write!(
+        stdout,
+        "(reverse-i-search)`\x1b[36m{query}\x1b[0m': {match_text}"
+    )
+    .map_err(|e| format!("writing search: {e}"))?;
+    stdout
+        .flush()
+        .map_err(|e| format!("flushing search: {e}"))?;
     Ok(())
 }
 
@@ -4238,8 +4388,11 @@ fn read_interactive_line_raw(
                 if input.ends_with('\\') {
                     input.pop();
                     input.push('\n');
-                    write!(stdout, "\r\n... ").map_err(|e| format!("writing multiline prompt: {e}"))?;
-                    stdout.flush().map_err(|e| format!("flushing multiline prompt: {e}"))?;
+                    write!(stdout, "\r\n... ")
+                        .map_err(|e| format!("writing multiline prompt: {e}"))?;
+                    stdout
+                        .flush()
+                        .map_err(|e| format!("flushing multiline prompt: {e}"))?;
                     continue;
                 }
                 if let Some(suggestion) = input
@@ -4388,7 +4541,9 @@ fn read_interactive_line_raw(
                     queue!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))
                         .map_err(|e| format!("clearing prompt: {e}"))?;
                     write_terminal_newline(&mut stdout)?;
-                    stdout.flush().map_err(|e| format!("clearing prompt: {e}"))?;
+                    stdout
+                        .flush()
+                        .map_err(|e| format!("clearing prompt: {e}"))?;
                     return Ok(PromptInput::Exit);
                 }
                 input.clear();
@@ -4492,7 +4647,9 @@ fn draw_command_palette(
     palette: &mut PaletteScreen,
 ) -> Result<(), String> {
     let commands = command_suggestions(input);
-    let width = terminal::size().map(|(width, _)| width as usize).unwrap_or(80);
+    let width = terminal::size()
+        .map(|(width, _)| width as usize)
+        .unwrap_or(80);
     let box_width = width.saturating_sub(1).max(20);
     let row_width = box_width.saturating_sub(4);
 
@@ -4550,10 +4707,17 @@ fn draw_command_palette(
             .map_err(|e| format!("drawing command: {e}"))?;
         }
     }
-    write!(stdout, "\x1b[38;5;244m╰{}╯\x1b[0m\r\n", "─".repeat(box_width - 2))
-        .map_err(|e| format!("drawing command palette footer: {e}"))?;
-    write!(stdout, "  \x1b[2m↑/↓ select · Tab complete · Enter run · Esc exit\x1b[0m\r\n")
-        .map_err(|e| format!("drawing command palette hint: {e}"))?;
+    write!(
+        stdout,
+        "\x1b[38;5;244m╰{}╯\x1b[0m\r\n",
+        "─".repeat(box_width - 2)
+    )
+    .map_err(|e| format!("drawing command palette footer: {e}"))?;
+    write!(
+        stdout,
+        "  \x1b[2m↑/↓ select · Tab complete · Enter run · Esc exit\x1b[0m\r\n"
+    )
+    .map_err(|e| format!("drawing command palette hint: {e}"))?;
     palette.inline_rows = (row_count + 3) as u16;
     write!(stdout, "{prompt}{input}").map_err(|e| format!("drawing command prompt: {e}"))?;
     stdout
@@ -4809,10 +4973,18 @@ fn draw_model_picker(
         .skip(query_chars.len().saturating_sub(query_columns))
         .collect::<String>();
     write_row(stdout, &format!("{search_prompt}{visible_query}"), false)?;
-    write!(stdout, "\x1b[38;5;244m├{}┤\x1b[0m\r\n", "─".repeat(box_width - 2))
-        .map_err(|e| format!("drawing model picker: {e}"))?;
+    write!(
+        stdout,
+        "\x1b[38;5;244m├{}┤\x1b[0m\r\n",
+        "─".repeat(box_width - 2)
+    )
+    .map_err(|e| format!("drawing model picker: {e}"))?;
     if matches.is_empty() {
-        write_row(stdout, "No matches. Edit search or press Esc to clear it.", false)?;
+        write_row(
+            stdout,
+            "No matches. Edit search or press Esc to clear it.",
+            false,
+        )?;
     }
     for (visible_index, choice_index) in matches.iter().enumerate().take(end).skip(start) {
         let choice = &choices[*choice_index];
@@ -4823,10 +4995,22 @@ fn draw_model_picker(
         } else {
             " "
         };
-        let pointer = if visible_index == selected { "›" } else { " " };
-        write_row(stdout, &format!("{pointer} {marker} {row}"), visible_index == selected)?;
+        let pointer = if visible_index == selected {
+            "›"
+        } else {
+            " "
+        };
+        write_row(
+            stdout,
+            &format!("{pointer} {marker} {row}"),
+            visible_index == selected,
+        )?;
     }
-    let range_start = if matches.is_empty() { 0 } else { page_start + 1 };
+    let range_start = if matches.is_empty() {
+        0
+    } else {
+        page_start + 1
+    };
     write_row(
         stdout,
         &format!(
@@ -4839,11 +5023,20 @@ fn draw_model_picker(
         ),
         false,
     )?;
-    write_row(stdout, "↑/↓ move · ←/→ page · Enter select · Esc cancel/search", false)?;
-    write!(stdout, "\x1b[38;5;244m╰{}╯\x1b[0m", "─".repeat(box_width - 2))
-        .map_err(|e| format!("drawing model picker: {e}"))?;
-    let cursor_column = (2 + terminal_text_width(search_prompt) + terminal_text_width(&visible_query))
-        .min(width.saturating_sub(1) as usize) as u16;
+    write_row(
+        stdout,
+        "↑/↓ move · ←/→ page · Enter select · Esc cancel/search",
+        false,
+    )?;
+    write!(
+        stdout,
+        "\x1b[38;5;244m╰{}╯\x1b[0m",
+        "─".repeat(box_width - 2)
+    )
+    .map_err(|e| format!("drawing model picker: {e}"))?;
+    let cursor_column =
+        (2 + terminal_text_width(search_prompt) + terminal_text_width(&visible_query))
+            .min(width.saturating_sub(1) as usize) as u16;
     queue!(stdout, MoveTo(cursor_column, 1))
         .map_err(|e| format!("positioning model search cursor: {e}"))?;
     stdout
@@ -5411,9 +5604,13 @@ fn select_menu_option_b(
             println!("  {}{}) {:<7} {}", mark, index + 1, name, desc);
         }
         print!("Choose [1-{}] or Enter to keep: ", items.len());
-        io::stdout().flush().map_err(|e| format!("flushing menu: {e}"))?;
+        io::stdout()
+            .flush()
+            .map_err(|e| format!("flushing menu: {e}"))?;
         let mut line = String::new();
-        io::stdin().read_line(&mut line).map_err(|e| format!("reading choice: {e}"))?;
+        io::stdin()
+            .read_line(&mut line)
+            .map_err(|e| format!("reading choice: {e}"))?;
         let trimmed = line.trim();
         if trimmed.is_empty() {
             return Ok(None);
@@ -5445,13 +5642,25 @@ fn select_menu_option_b(
         }
         let title_part = format!("╭── {title} ");
         let pad = box_width.saturating_sub(title_part.chars().count() + 1);
-        write!(stdout, "\x1b[38;5;244m{title_part}{}\x1b[0m\r\n", "─".repeat(pad) + "╮")
-            .map_err(|e| format!("drawing menu header: {e}"))?;
+        write!(
+            stdout,
+            "\x1b[38;5;244m{title_part}{}\x1b[0m\r\n",
+            "─".repeat(pad) + "╮"
+        )
+        .map_err(|e| format!("drawing menu header: {e}"))?;
 
         for (index, (name, desc, is_active)) in items.iter().enumerate() {
             let is_hovered = index == selected;
-            let pointer = if is_hovered { "\x1b[1;36m›\x1b[0m" } else { " " };
-            let check = if *is_active { "\x1b[1;32m✓\x1b[0m" } else { " " };
+            let pointer = if is_hovered {
+                "\x1b[1;36m›\x1b[0m"
+            } else {
+                " "
+            };
+            let check = if *is_active {
+                "\x1b[1;32m✓\x1b[0m"
+            } else {
+                " "
+            };
             let num = format!("{}.", index + 1);
             let name_colored = if is_hovered {
                 format!("\x1b[1;37m{:<7}\x1b[0m", name)
@@ -5463,9 +5672,7 @@ fn select_menu_option_b(
             } else {
                 format!("\x1b[38;5;244m{desc}\x1b[0m")
             };
-            let right_pad = box_width
-                .saturating_sub(16 + desc.chars().count())
-                .max(1);
+            let right_pad = box_width.saturating_sub(16 + desc.chars().count()).max(1);
             write!(
                 stdout,
                 "\x1b[38;5;244m│\x1b[0m {pointer} {check} {num} {name_colored} {desc_colored}{}\x1b[38;5;244m│\x1b[0m\r\n",
@@ -5474,8 +5681,12 @@ fn select_menu_option_b(
             .map_err(|e| format!("drawing row: {e}"))?;
         }
 
-        write!(stdout, "\x1b[38;5;244m╰{}╯\x1b[0m\r\n", "─".repeat(box_width.saturating_sub(2)))
-            .map_err(|e| format!("drawing footer: {e}"))?;
+        write!(
+            stdout,
+            "\x1b[38;5;244m╰{}╯\x1b[0m\r\n",
+            "─".repeat(box_width.saturating_sub(2))
+        )
+        .map_err(|e| format!("drawing footer: {e}"))?;
         write!(
             stdout,
             "  \x1b[2m↑/↓ move · Enter select · 1–{} jump · Esc cancel\x1b[0m",
@@ -5567,10 +5778,15 @@ fn configure_settings() -> Result<(), String> {
         );
         let progress_style = configured_progress_style(&config);
         println!("  6) Progress style: {progress_style}");
-        print!("Choose a setting [1-6] or Enter to cancel: ");
-        io::stdout().flush().map_err(|e| format!("flushing settings: {e}"))?;
+        println!("  7) Color theme: {}", configured_theme(&config).name);
+        print!("Choose a setting [1-7] or Enter to cancel: ");
+        io::stdout()
+            .flush()
+            .map_err(|e| format!("flushing settings: {e}"))?;
         let mut selection = String::new();
-        io::stdin().read_line(&mut selection).map_err(|e| format!("reading settings choice: {e}"))?;
+        io::stdin()
+            .read_line(&mut selection)
+            .map_err(|e| format!("reading settings choice: {e}"))?;
         match selection.trim() {
             "1" => configure_request_interval(&mut config),
             "2" => {
@@ -5582,11 +5798,16 @@ fn configure_settings() -> Result<(), String> {
             "4" => configure_reasoning_effort(),
             "5" => toggle_auto_approval(),
             "6" => {
-                let next_style = if progress_style == "inline" { "compact" } else { "inline" };
+                let next_style = if progress_style == "inline" {
+                    "compact"
+                } else {
+                    "inline"
+                };
                 config.progress_style = Some(next_style.to_string());
                 save_user_config(&config)?;
                 Ok(())
             }
+            "7" => configure_theme(),
             _ => Ok(()),
         }
     } else {
@@ -5598,11 +5819,15 @@ fn configure_settings_interactive() -> Result<(), String> {
     let mut guard = RawModeGuard::acquire()?;
     let mut stdout = io::stdout();
     let mut selected = 0usize;
-    let num_items = 6usize;
+    let num_items = 7usize;
     let term_width = terminal::size().map(|(w, _)| w as usize).unwrap_or(80);
     let box_width = term_width.saturating_sub(4).clamp(55, 78);
 
-    let draw = |stdout: &mut io::Stdout, config: &UserConfig, selected: usize, is_first: bool| -> Result<(), String> {
+    let draw = |stdout: &mut io::Stdout,
+                config: &UserConfig,
+                selected: usize,
+                is_first: bool|
+     -> Result<(), String> {
         if !is_first {
             let lines_to_rewind = (num_items + 2) as u16;
             queue!(
@@ -5615,8 +5840,12 @@ fn configure_settings_interactive() -> Result<(), String> {
         }
         let title_part = "╭── Settings ";
         let pad = box_width.saturating_sub(title_part.chars().count() + 1);
-        write!(stdout, "\x1b[38;5;244m{title_part}{}\x1b[0m\r\n", "─".repeat(pad) + "╮")
-            .map_err(|e| format!("drawing settings header: {e}"))?;
+        write!(
+            stdout,
+            "\x1b[38;5;244m{title_part}{}\x1b[0m\r\n",
+            "─".repeat(pad) + "╮"
+        )
+        .map_err(|e| format!("drawing settings header: {e}"))?;
 
         let mode = configured_agent_mode(config);
         let mode_badge = match mode {
@@ -5647,6 +5876,13 @@ fn configure_settings_interactive() -> Result<(), String> {
             _ => "\x1b[38;5;244m[ DEFAULT ]\x1b[0m",
         };
 
+        let theme = configured_theme(config);
+        let theme_badge = format!(
+            "\x1b[1;38;5;{}m[ {} ]\x1b[0m",
+            theme.accent,
+            theme.name.to_ascii_uppercase()
+        );
+
         let followups = config.follow_up_suggestions.unwrap_or(false);
         let followups_badge = if followups {
             "\x1b[1;32m[ ON ]\x1b[0m "
@@ -5654,21 +5890,52 @@ fn configure_settings_interactive() -> Result<(), String> {
             "\x1b[38;5;244m[ OFF ]\x1b[0m"
         };
 
-        let delay = config.request_interval_seconds.unwrap_or(DEFAULT_REQUEST_INTERVAL_SECONDS);
+        let delay = config
+            .request_interval_seconds
+            .unwrap_or(DEFAULT_REQUEST_INTERVAL_SECONDS);
         let delay_badge = format!("\x1b[1;37m[ {:>2}s ]\x1b[0m", delay);
 
         let rows = [
-            ("1. Agent Mode", mode_badge, "Cycle ask, plan, or build mode"),
-            ("2. Progress Style", progress_badge, "1-line tool logs vs live spinner"),
-            ("3. Auto-approve Actions", approve_badge, "Ask before file writes and commands"),
-            ("4. Reasoning Effort", effort_badge, "Model provider reasoning depth"),
-            ("5. Follow-up Suggestions", followups_badge, "Clickable next-step prompt buttons"),
-            ("6. Request Delay", &delay_badge, "Throttle interval between runs"),
+            (
+                "1. Agent Mode",
+                mode_badge,
+                "Cycle ask, plan, or build mode",
+            ),
+            (
+                "2. Progress Style",
+                progress_badge,
+                "1-line tool logs vs live spinner",
+            ),
+            (
+                "3. Auto-approve Actions",
+                approve_badge,
+                "Ask before file writes and commands",
+            ),
+            (
+                "4. Reasoning Effort",
+                effort_badge,
+                "Model provider reasoning depth",
+            ),
+            (
+                "5. Follow-up Suggestions",
+                followups_badge,
+                "Clickable next-step prompt buttons",
+            ),
+            (
+                "6. Request Delay",
+                &delay_badge,
+                "Throttle interval between runs",
+            ),
+            ("7. Color Theme", &theme_badge, "Set terminal color palette"),
         ];
 
         for (index, (name, badge, desc)) in rows.iter().enumerate() {
             let is_hovered = index == selected;
-            let pointer = if is_hovered { "\x1b[1;36m›\x1b[0m" } else { " " };
+            let pointer = if is_hovered {
+                format!("\x1b[1;38;5;{}m›\x1b[0m", theme.accent)
+            } else {
+                " ".to_string()
+            };
             let name_colored = if is_hovered {
                 format!("\x1b[1;37m{:<25}\x1b[0m", name)
             } else {
@@ -5679,9 +5946,7 @@ fn configure_settings_interactive() -> Result<(), String> {
             } else {
                 format!("\x1b[38;5;244m{desc}\x1b[0m")
             };
-            let right_pad = box_width
-                .saturating_sub(44 + desc.chars().count())
-                .max(1);
+            let right_pad = box_width.saturating_sub(44 + desc.chars().count()).max(1);
             write!(
                 stdout,
                 "\x1b[38;5;244m│\x1b[0m {pointer} {name_colored} {badge}  {desc_colored}{}\x1b[38;5;244m│\x1b[0m\r\n",
@@ -5690,14 +5955,20 @@ fn configure_settings_interactive() -> Result<(), String> {
             .map_err(|e| format!("drawing settings row: {e}"))?;
         }
 
-        write!(stdout, "\x1b[38;5;244m╰{}╯\x1b[0m\r\n", "─".repeat(box_width.saturating_sub(2)))
-            .map_err(|e| format!("drawing settings footer: {e}"))?;
         write!(
             stdout,
-            "  \x1b[2m↑/↓ move · Enter/Space toggle · 1–6 jump · Esc done\x1b[0m"
+            "\x1b[38;5;244m╰{}╯\x1b[0m\r\n",
+            "─".repeat(box_width.saturating_sub(2))
+        )
+        .map_err(|e| format!("drawing settings footer: {e}"))?;
+        write!(
+            stdout,
+            "  \x1b[2m↑/↓ move · Enter/Space toggle · 1–7 jump · Esc done\x1b[0m"
         )
         .map_err(|e| format!("drawing hint: {e}"))?;
-        stdout.flush().map_err(|e| format!("flushing settings: {e}"))?;
+        stdout
+            .flush()
+            .map_err(|e| format!("flushing settings: {e}"))?;
         Ok(())
     };
 
@@ -5773,7 +6044,11 @@ fn toggle_setting_item(config: &mut UserConfig, item_index: usize) -> Result<(),
         1 => {
             // Progress style toggle
             let current = configured_progress_style(config);
-            let next = if current == "inline" { "compact" } else { "inline" };
+            let next = if current == "inline" {
+                "compact"
+            } else {
+                "inline"
+            };
             config.progress_style = Some(next.to_string());
         }
         2 => {
@@ -5799,7 +6074,9 @@ fn toggle_setting_item(config: &mut UserConfig, item_index: usize) -> Result<(),
         }
         5 => {
             // Delay cycle: 0 -> 1 -> 2 -> 5 -> 10 -> 0
-            let current = config.request_interval_seconds.unwrap_or(DEFAULT_REQUEST_INTERVAL_SECONDS);
+            let current = config
+                .request_interval_seconds
+                .unwrap_or(DEFAULT_REQUEST_INTERVAL_SECONDS);
             let next = match current {
                 0 => 1,
                 1 => 2,
@@ -5808,6 +6085,14 @@ fn toggle_setting_item(config: &mut UserConfig, item_index: usize) -> Result<(),
                 _ => 0,
             };
             config.request_interval_seconds = Some(next);
+        }
+        6 => {
+            let current = configured_theme(config).id;
+            let index = THEMES
+                .iter()
+                .position(|theme| theme.id == current)
+                .unwrap_or(0);
+            config.theme = Some(THEMES[(index + 1) % THEMES.len()].id.to_string());
         }
         _ => return Ok(()),
     }
@@ -5833,9 +6118,21 @@ fn configure_agent_mode() -> Result<(), String> {
     let mut config = load_user_config()?;
     let current = configured_agent_mode(&config);
     let items = [
-        ("Ask", "Answer questions; inspect context, no changes", current == "ask"),
-        ("Plan", "Inspect project & outline plan; no edits or commands", current == "plan"),
-        ("Build", "Implement requested changes; edits & commands allowed", current == "build"),
+        (
+            "Ask",
+            "Answer questions; inspect context, no changes",
+            current == "ask",
+        ),
+        (
+            "Plan",
+            "Inspect project & outline plan; no edits or commands",
+            current == "plan",
+        ),
+        (
+            "Build",
+            "Implement requested changes; edits & commands allowed",
+            current == "build",
+        ),
     ];
     let initial = match current {
         "ask" => 0,
@@ -5872,15 +6169,20 @@ fn cycle_agent_mode() -> Result<(), String> {
 
 fn configure_reasoning_effort() -> Result<(), String> {
     let mut config = load_user_config()?;
-    let current = config
-        .reasoning_effort
-        .as_deref()
-        .unwrap_or("default");
+    let current = config.reasoning_effort.as_deref().unwrap_or("default");
     let items = [
         ("Low", "Faster, lighter reasoning", current == "low"),
         ("Medium", "Balanced reasoning depth", current == "medium"),
-        ("High", "Deep, thorough reasoning analysis", current == "high"),
-        ("Provider default", "Let the model provider decide", current == "default"),
+        (
+            "High",
+            "Deep, thorough reasoning analysis",
+            current == "high",
+        ),
+        (
+            "Provider default",
+            "Let the model provider decide",
+            current == "default",
+        ),
     ];
     let initial = match current {
         "low" => 0,
@@ -5915,6 +6217,142 @@ fn title_case(value: &str) -> String {
         .next()
         .map(|first| first.to_uppercase().to_string() + chars.as_str())
         .unwrap_or_default()
+}
+
+fn configure_theme() -> Result<(), String> {
+    let config = load_user_config()?;
+    let current = configured_theme(&config).id;
+    let mut selected = THEMES
+        .iter()
+        .position(|theme| theme.id == current)
+        .unwrap_or(0);
+
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        println!("Themes:");
+        for (index, theme) in THEMES.iter().enumerate() {
+            println!(
+                "  {}) {}{}",
+                index + 1,
+                theme.name,
+                if theme.id == current {
+                    " (current)"
+                } else {
+                    ""
+                }
+            );
+        }
+        print!("Choose a theme [1-{}] or Enter to cancel: ", THEMES.len());
+        io::stdout()
+            .flush()
+            .map_err(|error| format!("flushing theme list: {error}"))?;
+        let mut choice = String::new();
+        io::stdin()
+            .read_line(&mut choice)
+            .map_err(|error| format!("reading theme choice: {error}"))?;
+        if let Ok(index) = choice.trim().parse::<usize>() {
+            if let Some(theme) = index.checked_sub(1).and_then(|index| THEMES.get(index)) {
+                let mut config = load_user_config()?;
+                config.theme = Some(theme.id.to_string());
+                save_user_config(&config)?;
+                println!("Theme set to {}.", theme.name);
+            }
+        }
+        return Ok(());
+    }
+
+    let mut guard = RawModeGuard::acquire()?;
+    let mut stdout = io::stdout();
+    let box_width = terminal::size()
+        .map(|(width, _)| width as usize)
+        .unwrap_or(80)
+        .saturating_sub(2)
+        .max(55);
+    let draw = |stdout: &mut io::Stdout, selected: usize, first: bool| -> Result<(), String> {
+        if !first {
+            queue!(
+                stdout,
+                MoveUp((THEMES.len() + 2) as u16),
+                MoveToColumn(0),
+                Clear(ClearType::FromCursorDown)
+            )
+            .map_err(|error| format!("updating theme picker: {error}"))?;
+        }
+        let title = "╭── Color Theme ";
+        let header_fill = box_width.saturating_sub(title.chars().count() + 1);
+        write!(
+            stdout,
+            "\x1b[38;5;244m{title}{}╮\x1b[0m\r\n",
+            "─".repeat(header_fill)
+        )
+        .map_err(|error| format!("drawing theme picker: {error}"))?;
+        for (index, theme) in THEMES.iter().enumerate() {
+            let pointer = if index == selected {
+                format!("\x1b[1;38;5;{}m›\x1b[0m", theme.accent)
+            } else {
+                " ".to_string()
+            };
+            let label_style = if index == selected {
+                "\x1b[1;37m"
+            } else {
+                "\x1b[37m"
+            };
+            let current_mark = if theme.id == current { "  current" } else { "" };
+            let row_width = 46 + current_mark.chars().count();
+            let right_pad = box_width.saturating_sub(row_width);
+            write!(
+                stdout,
+                "\x1b[38;5;244m│\x1b[0m {pointer} {label_style}{:<12}\x1b[0m ",
+                theme.name
+            )
+            .map_err(|error| format!("drawing theme choice: {error}"))?;
+            write!(stdout, "\x1b[1;38;5;{}m● accent\x1b[0m  \x1b[1;38;5;{}m● success\x1b[0m  \x1b[38;5;{}m● muted\x1b[0m{current_mark}{}\x1b[38;5;244m│\x1b[0m\r\n", theme.accent, theme.success, theme.muted, " ".repeat(right_pad))
+                .map_err(|error| format!("drawing theme preview: {error}"))?;
+        }
+        write!(
+            stdout,
+            "\x1b[38;5;244m╰{}╯\x1b[0m\r\n  \x1b[2m↑/↓ move · Enter select · Esc cancel\x1b[0m",
+            "─".repeat(box_width.saturating_sub(2))
+        )
+        .map_err(|error| format!("drawing theme picker footer: {error}"))?;
+        stdout
+            .flush()
+            .map_err(|error| format!("flushing theme picker: {error}"))
+    };
+
+    write!(stdout, "\r\n").map_err(|error| format!("spacing theme picker: {error}"))?;
+    draw(&mut stdout, selected, true)?;
+    let chosen = loop {
+        let event = event::read().map_err(|error| format!("reading theme picker key: {error}"))?;
+        let Event::Key(key) = event else { continue };
+        if key.kind == KeyEventKind::Release {
+            continue;
+        }
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(THEMES.len() - 1),
+            KeyCode::Enter => break Some(THEMES[selected]),
+            KeyCode::Esc | KeyCode::Char('q') => break None,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break None,
+            _ => continue,
+        }
+        draw(&mut stdout, selected, false)?;
+    };
+    let _ = queue!(
+        stdout,
+        MoveUp((THEMES.len() + 2) as u16),
+        MoveToColumn(0),
+        Clear(ClearType::FromCursorDown)
+    );
+    let _ = stdout.flush();
+    guard.release();
+
+    if let Some(theme) = chosen {
+        let mut config = load_user_config()?;
+        config.theme = Some(theme.id.to_string());
+        save_user_config(&config)?;
+        println!("Theme set to {}.", theme.name);
+    }
+    Ok(())
 }
 
 fn configure_request_interval(config: &mut UserConfig) -> Result<(), String> {
@@ -6173,8 +6611,14 @@ fn rate_limit_retry_delay(
 
 const HELP_USAGE: &[(&str, &str)] = &[
     ("  nio [OPTIONS]", "Start the interactive prompt"),
-    ("  nio run [OPTIONS] <prompt>", "Run one turn and print the reply"),
-    ("  nio models [--format json] [--free]", "List model selectors (free models first)"),
+    (
+        "  nio run [OPTIONS] <prompt>",
+        "Run one turn and print the reply",
+    ),
+    (
+        "  nio models [--format json] [--free]",
+        "List model selectors (free models first)",
+    ),
     ("  nio provider", "Configure a provider interactively"),
     (
         "  nio sessions [list|show <ID>|delete <ID>]",
@@ -6184,25 +6628,61 @@ const HELP_USAGE: &[(&str, &str)] = &[
         "  nio config [list|get <KEY>|set <KEY> <VALUE>]",
         "Read or change saved settings",
     ),
-    ("  nio doctor [--format json]", "Check configuration and connectivity"),
-    ("  nio completions <bash|zsh|fish>", "Print a shell completion script"),
+    (
+        "  nio doctor [--format json]",
+        "Check configuration and connectivity",
+    ),
+    (
+        "  nio completions <bash|zsh|fish>",
+        "Print a shell completion script",
+    ),
     ("  nio help [COMMAND]", "Show help for a command"),
-    ("  nio --version (-v, --v, -V)", "Print the installed version"),
+    (
+        "  nio --version (-v, --v, -V)",
+        "Print the installed version",
+    ),
 ];
 
 const HELP_OPTIONS: &[(&str, &str)] = &[
-    ("  -m, --model <SELECTOR>", "Model selector from `nio models` (or NIO_MODEL)"),
-    ("  -s, --session <ID>", "Resume a saved conversation session"),
-    ("      --base-url <URL>", "OpenAI-compatible base URL (or NIO_BASE_URL)"),
-    ("      --api-key <KEY>", "API key (or NIO_API_KEY / OPENROUTER_API_KEY)"),
-    ("      --format <json|text>", "Output format; json emits NDJSON chat events"),
+    (
+        "  -m, --model <SELECTOR>",
+        "Model selector from `nio models` (or NIO_MODEL)",
+    ),
+    (
+        "  -s, --session <ID>",
+        "Resume a saved conversation session",
+    ),
+    (
+        "      --base-url <URL>",
+        "OpenAI-compatible base URL (or NIO_BASE_URL)",
+    ),
+    (
+        "      --api-key <KEY>",
+        "API key (or NIO_API_KEY / OPENROUTER_API_KEY)",
+    ),
+    (
+        "      --format <json|text>",
+        "Output format; json emits NDJSON chat events",
+    ),
     ("      --dir <PATH>", "Project working directory"),
     ("      --mode <MODE>", "Turn mode: ask, plan, or build"),
-    ("      --reasoning <EFFORT>", "Reasoning effort: low, medium, high, default"),
-    ("      --file <PATH>", "Attach a UTF-8 text file; repeatable"),
-    ("      --trust-project", "Trust the project folder for this run"),
+    (
+        "      --reasoning <EFFORT>",
+        "Reasoning effort: low, medium, high, default",
+    ),
+    (
+        "      --file <PATH>",
+        "Attach a UTF-8 text file; repeatable",
+    ),
+    (
+        "      --trust-project",
+        "Trust the project folder for this run",
+    ),
     ("      --no-tools", "Disable project discovery and tools"),
-    ("      --auto", "Approve file writes and shell commands for this run"),
+    (
+        "      --auto",
+        "Approve file writes and shell commands for this run",
+    ),
 ];
 
 const HELP_INTERACTIVE: &[(&str, &str)] = &[
@@ -6212,12 +6692,19 @@ const HELP_INTERACTIVE: &[(&str, &str)] = &[
     ("  :help", "List commands"),
     ("  :model", "Switch the active model"),
     ("  :mode", "Choose Ask, Plan, or Build mode"),
-    ("  :approval", "Toggle automatic approval for writes and commands"),
+    (
+        "  :approval",
+        "Toggle automatic approval for writes and commands",
+    ),
     ("  :reasoning", "Set reasoning effort"),
+    ("  :theme", "Choose the terminal color theme"),
     ("  :provider", "Add or update a provider"),
     ("  :proxy", "Route model requests through a proxy"),
     ("  :path", "Show the current project directory"),
-    ("  :setting", "Configure mode, reasoning, approvals, and settings"),
+    (
+        "  :setting",
+        "Configure mode, reasoning, approvals, and settings",
+    ),
     ("  :bash", "Direct shell prompt; :ai returns"),
     ("  :quit", "Exit"),
 ];
@@ -6239,7 +6726,8 @@ fn sessions_dir() -> Result<PathBuf, String> {
 /// Session files are named after the hex-encoded session ID.
 fn decode_session_id(file_name: &str) -> Option<String> {
     let stem = file_name.strip_suffix(".json")?;
-    if stem.is_empty() || stem.len() % 2 != 0 || !stem.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if stem.is_empty() || stem.len() % 2 != 0 || !stem.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
         return None;
     }
     let bytes: Vec<u8> = (0..stem.len())
@@ -6266,11 +6754,7 @@ fn format_session_age(modified: std::time::SystemTime) -> String {
 }
 
 fn sessions_command(options: &Options) -> Result<(), CliError> {
-    let action = options
-        .prompt
-        .first()
-        .map(String::as_str)
-        .unwrap_or("list");
+    let action = options.prompt.first().map(String::as_str).unwrap_or("list");
     match action {
         "list" => list_sessions(options),
         "show" => {
@@ -6349,20 +6833,20 @@ fn list_sessions(options: &Options) -> Result<(), CliError> {
 fn show_session(id: &str) -> Result<(), CliError> {
     let path = session_history_path(id).map_err(CliError::from)?;
     let Some(contents) = optional_read(&path, RESPONSE_LIMIT * 4).map_err(CliError::from)? else {
-        return Err(CliError::usage(format!(
-            "no saved session with ID '{id}'"
-        )));
+        return Err(CliError::usage(format!("no saved session with ID '{id}'")));
     };
-    let value: Value = serde_json::from_slice(&contents)
-        .map_err(|error| CliError::runtime(format!("invalid session file {}: {error}", path.display())))?;
+    let value: Value = serde_json::from_slice(&contents).map_err(|error| {
+        CliError::runtime(format!("invalid session file {}: {error}", path.display()))
+    })?;
     println!("Session: {id}");
     if value.is_array() {
         let messages = value.as_array().map(Vec::len).unwrap_or(0);
         println!("  Format: legacy (no project binding; start a new session)");
         println!("  Messages: {messages}");
     } else {
-        let stored: SessionHistory = serde_json::from_value(value)
-            .map_err(|error| CliError::runtime(format!("invalid session file {}: {error}", path.display())))?;
+        let stored: SessionHistory = serde_json::from_value(value).map_err(|error| {
+            CliError::runtime(format!("invalid session file {}: {error}", path.display()))
+        })?;
         println!("  Project: {}", stored.project_root.display());
         println!(
             "  Project access: {}",
@@ -6387,9 +6871,7 @@ fn show_session(id: &str) -> Result<(), CliError> {
 fn delete_session(id: &str) -> Result<(), CliError> {
     let path = session_history_path(id).map_err(CliError::from)?;
     if !path.exists() {
-        return Err(CliError::usage(format!(
-            "no saved session with ID '{id}'"
-        )));
+        return Err(CliError::usage(format!("no saved session with ID '{id}'")));
     }
     std::fs::remove_file(&path)
         .map_err(|error| CliError::runtime(format!("deleting session '{id}': {error}")))?;
@@ -6400,12 +6882,7 @@ fn delete_session(id: &str) -> Result<(), CliError> {
 }
 
 fn config_command(options: &Options) -> Result<(), CliError> {
-    match options
-        .prompt
-        .first()
-        .map(String::as_str)
-        .unwrap_or("list")
-    {
+    match options.prompt.first().map(String::as_str).unwrap_or("list") {
         "list" => config_list(),
         "get" => {
             let key = options
@@ -6440,10 +6917,7 @@ fn config_list() -> Result<(), CliError> {
         println!("  (not created yet; defaults are in use)");
     }
     let model = read_saved_model().map_err(CliError::from)?;
-    println!(
-        "  model: {}",
-        model.as_deref().unwrap_or("(not set)")
-    );
+    println!("  model: {}", model.as_deref().unwrap_or("(not set)"));
     println!("  mode: {}", configured_agent_mode(&config));
     println!(
         "  reasoning: {}",
@@ -6500,6 +6974,7 @@ fn config_get(key: &str) -> Result<(), CliError> {
         "progress" | "progress_style" | "tool_display" => {
             println!("{}", configured_progress_style(&config));
         }
+        "theme" => println!("{}", configured_theme(&config).id),
         "proxy" => println!("{}", config.proxy_url.as_deref().unwrap_or("")),
         "trusted" => {
             for folder in &config.trusted_folders {
@@ -6508,7 +6983,7 @@ fn config_get(key: &str) -> Result<(), CliError> {
         }
         other => {
             return Err(CliError::usage(format!(
-                "unknown config key '{other}'. Keys: model, mode, reasoning, approval, interval, suggestions, progress, proxy, trusted."
+                "unknown config key '{other}'. Keys: model, mode, reasoning, approval, interval, suggestions, progress, theme, proxy, trusted."
             )));
         }
     }
@@ -6560,8 +7035,8 @@ fn config_set(key: &str, value: &str) -> Result<(), CliError> {
             saved_display = value.to_string();
         }
         "approval" => {
-            let enabled =
-                parse_yes_no(value).ok_or_else(|| CliError::usage("approval must be true or false"))?;
+            let enabled = parse_yes_no(value)
+                .ok_or_else(|| CliError::usage("approval must be true or false"))?;
             config.auto_approve_actions = Some(enabled);
             saved_display = enabled.to_string();
         }
@@ -6614,9 +7089,21 @@ fn config_set(key: &str, value: &str) -> Result<(), CliError> {
             config.progress_style = Some(style.to_string());
             saved_display = style.to_string();
         }
+        "theme" => {
+            let theme = THEMES
+                .iter()
+                .find(|theme| theme.id == value.to_ascii_lowercase())
+                .ok_or_else(|| {
+                    CliError::usage(
+                        "theme must be default, ocean, forest, sunset, dracula, nord, solarized, or monokai",
+                    )
+                })?;
+            config.theme = Some(theme.id.to_string());
+            saved_display = theme.id.to_string();
+        }
         other => {
             return Err(CliError::usage(format!(
-                "unknown config key '{other}'. Keys: model, mode, reasoning, approval, interval, suggestions, progress, proxy."
+                "unknown config key '{other}'. Keys: model, mode, reasoning, approval, interval, suggestions, progress, theme, proxy."
             )));
         }
     }
@@ -6741,7 +7228,11 @@ async fn doctor_command(options: &Options) -> Result<(), CliError> {
                 } else {
                     "not created yet; defaults in use"
                 };
-                checks.push(("config".into(), "pass", format!("{} {state}", path.display())));
+                checks.push((
+                    "config".into(),
+                    "pass",
+                    format!("{} {state}", path.display()),
+                ));
             }
             Err(error) => checks.push(("config".into(), "fail", error)),
         },
@@ -6796,7 +7287,11 @@ async fn doctor_command(options: &Options) -> Result<(), CliError> {
             "warn",
             format!("{shell_cmd} exited with status {status}"),
         )),
-        Err(error) => checks.push(("shell".into(), "fail", format!("{shell_cmd} is not available: {error}"))),
+        Err(error) => checks.push((
+            "shell".into(),
+            "fail",
+            format!("{shell_cmd} is not available: {error}"),
+        )),
     }
 
     let proxy = configured_proxy_url();
@@ -6810,11 +7305,7 @@ async fn doctor_command(options: &Options) -> Result<(), CliError> {
         Ok(None) => checks.push(("proxy".into(), "pass", "none configured".into())),
     }
 
-    match build_doctor_client(
-        proxy.as_ref()
-            .ok()
-            .and_then(|option| option.as_deref()),
-    ) {
+    match build_doctor_client(proxy.as_ref().ok().and_then(|option| option.as_deref())) {
         Err(error) => checks.push(("connectivity".into(), "fail", error)),
         Ok(client) => {
             let mut targets = vec![("Kilo Gateway".to_string(), KILO_BASE_URL.to_string())];
@@ -6825,27 +7316,28 @@ async fn doctor_command(options: &Options) -> Result<(), CliError> {
                     .filter(|provider| provider.id != "kilo")
                     .map(|provider| (provider.name.clone(), provider.base_url.clone())),
             );
-            if config.providers.iter().all(|provider| provider.id != "openrouter")
+            if config
+                .providers
+                .iter()
+                .all(|provider| provider.id != "openrouter")
                 && (env::var("OPENROUTER_API_KEY").is_ok()
                     || env::var("NIO_OPENROUTER_API_KEY").is_ok())
             {
                 targets.push(("OpenRouter".into(), OPENROUTER_BASE_URL.into()));
             }
-            let results =
-                futures_util::future::join_all(targets.iter().map(|(name, base_url)| {
-                    let client = &client;
-                    async move {
-                        let result = probe_provider_models(client, base_url).await;
-                        (name.clone(), result)
-                    }
-                }))
-                .await;
+            let results = futures_util::future::join_all(targets.iter().map(|(name, base_url)| {
+                let client = &client;
+                async move {
+                    let result = probe_provider_models(client, base_url).await;
+                    (name.clone(), result)
+                }
+            }))
+            .await;
             for (name, result) in results {
                 let key = format!("connectivity · {name}");
                 match result {
                     Ok((status, _))
-                        if status.is_success()
-                            || status == reqwest::StatusCode::UNAUTHORIZED =>
+                        if status.is_success() || status == reqwest::StatusCode::UNAUTHORIZED =>
                     {
                         checks.push((key, "pass", format!("reachable (HTTP {status})")));
                     }
@@ -6864,12 +7356,12 @@ async fn doctor_command(options: &Options) -> Result<(), CliError> {
             format!("resolving {}: {error}", root.display()),
         )),
         Ok(root) => {
-            if config
-                .trusted_folders
-                .iter()
-                .any(|folder| folder == &root)
-            {
-                checks.push(("project".into(), "pass", format!("trusted: {}", root.display())));
+            if config.trusted_folders.iter().any(|folder| folder == &root) {
+                checks.push((
+                    "project".into(),
+                    "pass",
+                    format!("trusted: {}", root.display()),
+                ));
             } else {
                 checks.push((
                     "project".into(),
@@ -6887,9 +7379,7 @@ async fn doctor_command(options: &Options) -> Result<(), CliError> {
     if options.json_output {
         let items: Vec<Value> = checks
             .iter()
-            .map(|(name, status, detail)| {
-                json!({"name": name, "status": status, "detail": detail})
-            })
+            .map(|(name, status, detail)| json!({"name": name, "status": status, "detail": detail}))
             .collect();
         emit_json(&json!({"type": "doctor", "checks": items}));
     } else {
@@ -6960,8 +7450,10 @@ fn print_help(topic: Option<&str>) -> Result<(), String> {
             println!("Options:");
             print_help_pairs(HELP_OPTIONS, 28);
             println!();
-            println!("Exit codes: 0 success, 1 runtime or provider error,\n\
-                      2 usage error, 130 cancelled.");
+            println!(
+                "Exit codes: 0 success, 1 runtime or provider error,\n\
+                      2 usage error, 130 cancelled."
+            );
             println!();
             println!("Examples:");
             println!("  nio run -m kilo::kilo-auto/free 'Explain this project'");
@@ -7018,7 +7510,10 @@ fn print_help(topic: Option<&str>) -> Result<(), String> {
                     ("  approval", "true | false (auto-approve writes/commands)"),
                     ("  interval", "Seconds between requests: 0-3600 or default"),
                     ("  suggestions", "true | false (follow-up suggestions)"),
-                    ("  progress", "inline | compact (tool progress display style)"),
+                    (
+                        "  progress",
+                        "inline | compact (tool progress display style)",
+                    ),
                     ("  proxy", "http(s) URL, or off to disable"),
                     ("  trusted", "Read-only list of trusted project folders"),
                 ],
@@ -7067,9 +7562,7 @@ fn print_help(topic: Option<&str>) -> Result<(), String> {
             println!("Print the installed NioAI version.");
         }
         Some(other) => {
-            return Err(format!(
-                "unknown help topic '{other}'. Run 'nio --help'."
-            ));
+            return Err(format!("unknown help topic '{other}'. Run 'nio --help'."));
         }
     }
     Ok(())

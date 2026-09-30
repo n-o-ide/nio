@@ -1,4 +1,5 @@
 //! Small resource bounds and persistence helpers shared by the CLI and hosted runs.
+use crossterm::terminal;
 use serde_json::Value;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -365,44 +366,116 @@ pub fn trim_history(history: &mut Vec<Value>, budget: usize) {
     }
 }
 
-pub fn preview(old: &[u8], new: &str) -> String {
+pub fn preview_for_path(path: &str, old: &[u8], new: &str) -> String {
+    preview_for_path_at(path, old, new, 1)
+}
+
+pub fn preview_summary(path: &str, old: &[u8], new: &str) -> String {
     let old = String::from_utf8_lossy(old);
     let before: Vec<_> = old.lines().collect();
     let after: Vec<_> = new.lines().collect();
+    let (prefix, old_end, new_end) = changed_line_ranges(&before, &after);
+    format!(
+        "Edited {path} (+{} -{})",
+        new_end.saturating_sub(prefix),
+        old_end.saturating_sub(prefix)
+    )
+}
+
+pub fn preview_replacement(
+    path: &str,
+    original: &str,
+    old_fragment: &str,
+    new_fragment: &str,
+) -> String {
+    let Some(byte_offset) = original.find(old_fragment) else {
+        return preview_for_path(
+            path,
+            original.as_bytes(),
+            &original.replace(old_fragment, new_fragment),
+        );
+    };
+    let start_line = original[..byte_offset].lines().count() + 1;
+    preview_for_path_at(path, old_fragment.as_bytes(), new_fragment, start_line)
+}
+
+fn preview_for_path_at(path: &str, old: &[u8], new: &str, start_line: usize) -> String {
+    let old = String::from_utf8_lossy(old);
+    let before: Vec<_> = old.lines().collect();
+    let after: Vec<_> = new.lines().collect();
+    let (prefix, old_change_end, new_change_end) = changed_line_ranges(&before, &after);
+    let context_start = prefix.saturating_sub(3);
+    let old_context_end = (old_change_end + 3).min(before.len());
+    let new_context_end = (new_change_end + 3).min(after.len());
+    let mut output = format!(
+        "\x1b[1;38;5;244mdiff --git a/{path} b/{path}\x1b[0m\n\x1b[38;5;244m--- a/{path}\n+++ b/{path}\x1b[0m\n"
+    );
+    output.push_str(&format!(
+        "\x1b[1;38;5;39m@@ -{},{} +{},{} @@\x1b[0m\n",
+        start_line + context_start,
+        old_context_end - context_start,
+        start_line + context_start,
+        new_context_end - context_start
+    ));
+    let width = terminal::size()
+        .map(|(width, _)| width as usize)
+        .unwrap_or(120)
+        .saturating_sub(4)
+        .clamp(20, 200);
+    for line in &before[context_start..prefix] {
+        append_diff_line(&mut output, ' ', line, 244, width);
+    }
+    let mut omitted = false;
+    for line in &before[prefix..old_change_end] {
+        if output.lines().count() > 33 {
+            omitted = true;
+            break;
+        }
+        append_diff_line(&mut output, '-', line, 203, width);
+    }
+    for line in &after[prefix..new_change_end] {
+        if output.lines().count() > 63 {
+            omitted = true;
+            break;
+        }
+        append_diff_line(&mut output, '+', line, 114, width);
+    }
+    for line in &after[new_change_end..new_context_end] {
+        append_diff_line(&mut output, ' ', line, 244, width);
+    }
+    if omitted {
+        output.push_str("\x1b[2m  … remaining changed lines omitted …\x1b[0m\n");
+    }
+    let removals = old_change_end - prefix;
+    let additions = new_change_end - prefix;
+    output.push_str(&format!(
+        "\x1b[2m  {additions} additions, {removals} removals\x1b[0m\n"
+    ));
+    output
+}
+
+fn changed_line_ranges(before: &[&str], after: &[&str]) -> (usize, usize, usize) {
     let prefix = before
         .iter()
-        .zip(&after)
-        .take_while(|(a, b)| a == b)
+        .zip(after)
+        .take_while(|(old_line, new_line)| old_line == new_line)
         .count();
-    let suffix = before[prefix..]
-        .iter()
-        .rev()
-        .zip(after[prefix..].iter().rev())
-        .take_while(|(a, b)| a == b)
+    let max_suffix = before.len().min(after.len()).saturating_sub(prefix);
+    let suffix = (0..max_suffix)
+        .take_while(|offset| before[before.len() - offset - 1] == after[after.len() - offset - 1])
         .count();
-    let mut output = format!("\x1b[36m@@ from line {} @@\x1b[0m\n", prefix + 1);
-    for line in &before[prefix..before.len() - suffix] {
-        output.push_str("\x1b[31m-");
-        output.extend(
-            line.chars()
-                .take(200)
-                .filter(|c| !c.is_control() || *c == '\t'),
-        );
-        output.push_str("\x1b[0m\n");
-    }
-    for line in &after[prefix..after.len() - suffix] {
-        output.push_str("\x1b[32m+");
-        output.extend(
-            line.chars()
-                .take(200)
-                .filter(|c| !c.is_control() || *c == '\t'),
-        );
-        output.push_str("\x1b[0m\n");
-    }
-    if before[prefix..before.len() - suffix].len() > 30 || after[prefix..after.len() - suffix].len() > 30 {
-        output.push_str("\x1b[2m[additional changed lines omitted]\x1b[0m\n");
-    }
-    output
+    (prefix, before.len() - suffix, after.len() - suffix)
+}
+
+fn append_diff_line(output: &mut String, marker: char, line: &str, color: u8, width: usize) {
+    output.push_str(&format!("\x1b[38;5;{color}m{marker}",));
+    let safe_line: String = line
+        .chars()
+        .filter(|character| !character.is_control() || *character == '\t')
+        .take(width.saturating_sub(1))
+        .collect();
+    output.push_str(&safe_line);
+    output.push_str("\x1b[0m\n");
 }
 
 pub fn apply_patch(
@@ -578,7 +651,7 @@ mod tests {
 
     #[test]
     fn write_preview_shows_changed_lines() {
-        let diff = preview(b"same\nold\n", "same\nnew\n");
+        let diff = preview_for_path("file.txt", b"same\nold\n", "same\nnew\n");
         assert!(diff.contains("-old"));
         assert!(diff.contains("+new"));
     }
@@ -611,7 +684,9 @@ mod tests {
     #[test]
     fn apply_patch_replaces_exact_match() {
         let file = "fn main() {\n    println!(\"hello\");\n}\n";
-        let patched = super::apply_patch(file, "    println!(\"hello\");", "    println!(\"world\");").unwrap();
+        let patched =
+            super::apply_patch(file, "    println!(\"hello\");", "    println!(\"world\");")
+                .unwrap();
         assert_eq!(patched, "fn main() {\n    println!(\"world\");\n}\n");
     }
 
