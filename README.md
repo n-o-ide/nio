@@ -19,7 +19,7 @@ The executable is at `target/release/nio`.
 
 ## Configure and run
 
-Running `nio` starts a lightweight, line-based coding agent. On first launch, it fetches available models, lists free models first, asks you to choose one, and saves it as the default. Nio scans the current project and gives the model tools to list, search, and read files automatically. The agent asks before writing files or running shell commands. Kilo's public gateway provides keyless access to its free routes:
+Running `nio` starts a lightweight, line-based coding agent. Before accessing a project folder, Nio asks whether to trust it. Trusted folders are remembered; choosing no trust keeps project context and agent tools disabled for that run. Non-interactive runs also default to no project access. On first launch, Nio fetches available models, lists free models first, asks you to choose one, and saves it as the default. For trusted projects, Nio can list, search, and read files automatically. The agent asks before writing files or running shell commands. Kilo's public gateway provides keyless access to its free routes:
 
 ```sh
 nio

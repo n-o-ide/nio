@@ -72,6 +72,7 @@ struct Options {
     auto_approve: bool,
     workdir: Option<PathBuf>,
     session_id: Option<String>,
+    project_trusted: bool,
 }
 
 #[derive(Deserialize)]
@@ -347,6 +348,8 @@ struct UserConfig {
     proxy_url: Option<String>,
     #[serde(default)]
     providers: Vec<ProviderConfig>,
+    #[serde(default)]
+    trusted_folders: Vec<PathBuf>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -387,7 +390,10 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> Result<(), String> {
-    let options = parse_args(env::args().skip(1).collect())?;
+    let mut options = parse_args(env::args().skip(1).collect())?;
+    if matches!(options.command.as_str(), "interactive" | "run") {
+        options.project_trusted = confirm_project_trust(&options)?;
+    }
     match options.command.as_str() {
         "help" => {
             print_help();
@@ -402,6 +408,54 @@ async fn run() -> Result<(), String> {
         "provider" => configure_provider().await,
         "run" => chat(&options).await,
         command => Err(format!("unknown command '{command}'. Run 'nio --help'.")),
+    }
+}
+
+fn confirm_project_trust(options: &Options) -> Result<bool, String> {
+    let requested_root = options.workdir.as_deref().unwrap_or(Path::new("."));
+    let root = requested_root.canonicalize().map_err(|error| {
+        format!(
+            "resolving project directory '{}': {error}",
+            requested_root.display()
+        )
+    })?;
+    if !root.is_dir() {
+        return Err(format!(
+            "project path '{}' is not a directory",
+            root.display()
+        ));
+    }
+
+    let mut config = load_user_config()?;
+    if config.trusted_folders.iter().any(|path| path == &root) {
+        return Ok(true);
+    }
+
+    if !io::stdin().is_terminal() {
+        eprintln!(
+            "Project folder is not trusted; running without project tools. Run nio in a terminal to review and trust it."
+        );
+        return Ok(false);
+    }
+
+    println!("Trust this project folder?\n  {}", root.display());
+    println!(
+        "Trust allows Nio to read project files. Changes and commands still follow approval settings."
+    );
+    print!("[y] Trust  [N] No trust: ");
+    io::stdout()
+        .flush()
+        .map_err(|error| format!("writing trust prompt: {error}"))?;
+    let mut answer = String::new();
+    io::stdin()
+        .read_line(&mut answer)
+        .map_err(|error| format!("reading trust choice: {error}"))?;
+    if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        config.trusted_folders.push(root);
+        save_user_config(&config)?;
+        Ok(true)
+    } else {
+        Ok(false)
     }
 }
 
@@ -423,6 +477,7 @@ fn parse_args(args: Vec<String>) -> Result<Options, String> {
                 auto_approve: false,
                 workdir: None,
                 session_id: None,
+                project_trusted: false,
             });
         }
         Some("run") => "run".to_string(),
@@ -442,6 +497,7 @@ fn parse_args(args: Vec<String>) -> Result<Options, String> {
                 auto_approve: false,
                 workdir: None,
                 session_id: None,
+                project_trusted: false,
             });
         }
     };
@@ -479,6 +535,7 @@ fn parse_args(args: Vec<String>) -> Result<Options, String> {
                     auto_approve: false,
                     workdir: None,
                     session_id: None,
+                    project_trusted: false,
                 });
             }
             "--model" | "-m" => model = Some(args.next().ok_or("--model requires a value")?),
@@ -520,6 +577,7 @@ fn parse_args(args: Vec<String>) -> Result<Options, String> {
                     auto_approve,
                     workdir,
                     session_id,
+                    project_trusted: false,
                 });
             }
             _ if arg.starts_with('-') => return Err(format!("unknown option '{arg}'")),
@@ -541,6 +599,7 @@ fn parse_args(args: Vec<String>) -> Result<Options, String> {
         auto_approve,
         workdir,
         session_id,
+        project_trusted: false,
     })
 }
 
@@ -1376,7 +1435,9 @@ async fn run_agent_turn_inner(
             root.display()
         ));
     }
-    emit_status(options, "exploring", "Scanning project files");
+    if options.project_trusted {
+        emit_status(options, "exploring", "Scanning project files");
+    }
     let user_config = load_user_config()?;
     let mode = configured_agent_mode(&user_config);
     let auto_approve_actions =
@@ -1392,15 +1453,24 @@ async fn run_agent_turn_inner(
             "Mode: Build. Carry out the user's requested work. Inspect first, then make changes and run commands when appropriate. Ask before writing files or executing shell commands unless auto-approval was explicitly enabled."
         }
     };
-    let system = format!(
-        "You are NioAI, a coding agent working in the project at {}. Start by inspecting relevant files when needed; do not claim you cannot access the project. Read and search tools are automatic. Stay within the project directory. Be concise. {}",
-        root.display(),
-        mode_instructions
-    );
-    let overview = project_overview(&root);
-    let mut messages = vec![
-        json!({"role":"system", "content": format!("{system}\n\nProject overview:\n{overview}")}),
-    ];
+    let system = if options.project_trusted {
+        format!(
+            "You are NioAI, a coding agent working in the project at {}. Start by inspecting relevant files when needed; do not claim you cannot access the project. Read and search tools are automatic. Stay within the project directory. Be concise. {}",
+            root.display(),
+            mode_instructions
+        )
+    } else {
+        format!(
+            "You are NioAI. The user has not trusted the current project folder, so you have no access to its files and must not claim to have inspected them. Answer general questions and ask the user to trust the folder in an interactive terminal if project access is needed. Be concise. {}",
+            mode_instructions
+        )
+    };
+    let overview = if options.project_trusted {
+        format!("\n\nProject overview:\n{}", project_overview(&root))
+    } else {
+        String::new()
+    };
+    let mut messages = vec![json!({"role":"system", "content": format!("{system}{overview}")})];
     if history.len() > 32 {
         history.drain(..history.len() - 32);
     }
@@ -1415,7 +1485,11 @@ async fn run_agent_turn_inner(
         .unwrap_or(DEFAULT_REQUEST_INTERVAL_SECONDS);
     let mut last_request_started = None::<Instant>;
     let reasoning_effort = user_config.reasoning_effort.as_deref();
-    let tools = agent_tools(mode);
+    let tools = if options.project_trusted {
+        agent_tools(mode)
+    } else {
+        json!([])
+    };
     loop {
         let mut retry_count = 0u32;
         let response = loop {
@@ -1580,7 +1654,9 @@ async fn run_agent_turn_inner(
             };
             emit_status(options, status, &tool_label);
             emit_tool_event(options, &call, "running", &input, None);
-            let result = if !mode_allows_changes(mode)
+            let result = if !options.project_trusted {
+                Err("project folder is not trusted; project tools are disabled".to_string())
+            } else if !mode_allows_changes(mode)
                 && matches!(call.name.as_str(), "write_file" | "run_command")
             {
                 Err(format!(
@@ -1820,7 +1896,11 @@ async fn interactive(options: Options) -> Result<(), String> {
         prompt_history.drain(..prompt_history.len() - 100);
     }
     print_session_header(&model, &session_id)?;
-    println!("Project tools are available automatically.");
+    if options.project_trusted {
+        println!("Project tools are available automatically.");
+    } else {
+        println!("Project tools are disabled because this folder is not trusted.");
+    }
     println!("Type : or / for commands; :help for help.");
     print_prompt_divider()?;
 
