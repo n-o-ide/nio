@@ -867,7 +867,7 @@ fn emit_assistant_start(options: &Options) -> Result<(), String> {
         } else {
             "\n"
         };
-        print!("{newline}🔹 🤖 nio:{newline}  ");
+        print!("{newline}🔹 🤖 nio:{newline}      ");
         io::stdout()
             .flush()
             .map_err(|e| format!("writing response label: {e}"))?;
@@ -923,16 +923,16 @@ fn emit_json(value: &Value) {
 
 fn indent_response_lines(text: &str, newline: &str) -> Vec<u8> {
     let mut output =
-        Vec::with_capacity(text.len() + text.matches('\n').count() * (newline.len() + 2));
+        Vec::with_capacity(text.len() + text.matches('\n').count() * (newline.len() + 6));
     let mut previous_was_cr = false;
     for byte in text.bytes() {
         if byte == b'\n' && !previous_was_cr {
             output.extend_from_slice(newline.as_bytes());
-            output.extend_from_slice(b"  ");
+            output.extend_from_slice(b"      ");
             previous_was_cr = false;
             continue;
         } else if byte == b'\n' {
-            output.extend_from_slice(b"  ");
+            output.extend_from_slice(b"      ");
             previous_was_cr = false;
             continue;
         }
