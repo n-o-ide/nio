@@ -3607,20 +3607,38 @@ fn format_provider_error(status: u16, body: &str, gateway: Option<&str>) -> Stri
         );
     }
 
+    if matches!(status, 500 | 502 | 503 | 504) {
+        return format!(
+            "The model provider is temporarily unavailable (HTTP {status}). This model may be under high demand. Try again shortly or switch models with `:model`."
+        );
+    }
+
     let detail = serde_json::from_str::<Value>(body)
         .ok()
-        .and_then(|value| {
-            value
-                .pointer("/error/message")
-                .or_else(|| value.get("message"))
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
+        .and_then(provider_error_message)
         .unwrap_or_else(|| truncate(body.trim(), 500));
     if detail.is_empty() {
         format!("The provider returned HTTP {status}.")
     } else {
         format!("The provider returned HTTP {status}: {detail}")
+    }
+}
+
+fn provider_error_message(value: Value) -> Option<String> {
+    match value {
+        Value::Array(values) => values.into_iter().find_map(provider_error_message),
+        Value::Object(mut object) => {
+            for key in ["error", "message", "detail"] {
+                if let Some(value) = object.remove(key) {
+                    if let Some(message) = provider_error_message(value) {
+                        return Some(message);
+                    }
+                }
+            }
+            None
+        }
+        Value::String(message) if !message.trim().is_empty() => Some(message),
+        _ => None,
     }
 }
 
