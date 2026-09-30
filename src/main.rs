@@ -344,6 +344,8 @@ struct UserConfig {
     #[serde(default)]
     prompt_history: Vec<String>,
     #[serde(default)]
+    proxy_url: Option<String>,
+    #[serde(default)]
     providers: Vec<ProviderConfig>,
 }
 
@@ -1214,7 +1216,7 @@ async fn request_followup_suggestions(
         tokio::time::sleep(Duration::from_secs(delay)).await;
     }
 
-    let client = reqwest::Client::new();
+    let client = build_http_client()?;
     let url = endpoint(&base_url, "chat/completions");
     let mut retry_count = 0;
     let response = loop {
@@ -1362,7 +1364,7 @@ async fn run_agent_turn_inner(
 ) -> Result<(), String> {
     let (gateway, model_id) = split_model_selector(model)?;
     let (base_url, key) = resolve_model_provider(options, gateway, model_id)?;
-    let client = reqwest::Client::new();
+    let client = build_http_client()?;
 
     let root = options.workdir.as_deref().unwrap_or(Path::new("."));
     let root = root
@@ -1670,8 +1672,30 @@ async fn list_models(options: &Options) -> Result<(), String> {
     Ok(())
 }
 
+fn configured_proxy_url() -> Result<Option<String>, String> {
+    if let Ok(url) = env::var("NIO_PROXY") {
+        if !url.trim().is_empty() {
+            return Ok(Some(url));
+        }
+    }
+    Ok(load_user_config()?.proxy_url)
+}
+
+fn build_http_client() -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder();
+    if let Some(proxy_url) = configured_proxy_url()? {
+        let proxy = reqwest::Proxy::all(&proxy_url).map_err(|_| {
+            "invalid proxy URL; expected http://host:port or https://host:port".to_string()
+        })?;
+        builder = builder.proxy(proxy);
+    }
+    builder
+        .build()
+        .map_err(|error| format!("building HTTP client: {error}"))
+}
+
 async fn fetch_model_choices(options: &Options) -> Result<Vec<ModelChoice>, String> {
-    let client = reqwest::Client::new();
+    let client = build_http_client()?;
     let mut choices = Vec::new();
     let mut errors = Vec::new();
     let mut providers = vec![ProviderConfig {
@@ -1855,7 +1879,7 @@ async fn interactive(options: Options) -> Result<(), String> {
         }
         if input == ":help" {
             println!(
-                "Commands: :clear, :help, :model, :mode, :approval, :reasoning, :provider, :setting, :bash, :ai, :quit (use : or /)"
+                "Commands: :clear, :help, :model, :mode, :approval, :reasoning, :provider, :proxy, :setting, :bash, :ai, :quit (use : or /)"
             );
             continue;
         }
@@ -1894,6 +1918,10 @@ async fn interactive(options: Options) -> Result<(), String> {
         }
         if !command_mode && input == ":provider" {
             configure_provider().await?;
+            continue;
+        }
+        if !command_mode && input == ":proxy" {
+            configure_proxy().await?;
             continue;
         }
         if !command_mode && input == ":clear" {
@@ -2006,7 +2034,7 @@ fn print_prompt_divider() -> Result<(), String> {
         .map_err(|error| format!("writing prompt divider: {error}"))
 }
 
-const COMMANDS: [(&str, &str); 10] = [
+const COMMANDS: [(&str, &str); 11] = [
     (":clear", "Clear conversation history"),
     (":help", "Show available commands"),
     (":model", "Switch model"),
@@ -2016,6 +2044,7 @@ const COMMANDS: [(&str, &str); 10] = [
         "Toggle automatic approval for writes and commands",
     ),
     (":provider", "Configure model providers"),
+    (":proxy", "Route provider requests through a proxy"),
     (":reasoning", "Set reasoning effort"),
     (":bash", "Switch to a direct shell prompt"),
     (
@@ -2993,6 +3022,99 @@ async fn configure_provider() -> Result<(), String> {
     Ok(())
 }
 
+async fn configure_proxy() -> Result<(), String> {
+    let mut config = load_user_config()?;
+    let active = configured_proxy_url()?;
+    match active.as_deref() {
+        Some(url) => println!("Active proxy: {}", safe_proxy_label(url)),
+        None => {
+            println!("Active proxy: none configured (system proxy environment may still apply)")
+        }
+    }
+    println!(
+        "Use a proxy you own or are authorized to use. Public proxies can expose API traffic and credentials."
+    );
+    print!("HTTP(S) proxy URL, 'off' to disable the saved proxy, or Enter to keep: ");
+    io::stdout()
+        .flush()
+        .map_err(|error| format!("writing proxy prompt: {error}"))?;
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .map_err(|error| format!("reading proxy URL: {error}"))?;
+    let input = input.trim();
+    if input.is_empty() {
+        return Ok(());
+    }
+    if input.eq_ignore_ascii_case("off") {
+        config.proxy_url = None;
+        save_user_config(&config)?;
+        if env::var("NIO_PROXY").is_ok_and(|value| !value.trim().is_empty()) {
+            println!("Saved proxy disabled. NIO_PROXY still overrides this setting.");
+        } else {
+            println!("Saved proxy disabled.");
+        }
+        return Ok(());
+    }
+    validate_proxy_url(input)?;
+    config.proxy_url = Some(input.to_string());
+    save_user_config(&config)?;
+    println!("Saved proxy {}.", safe_proxy_label(input));
+    println!("Checking OpenRouter connectivity without sending your API key...");
+    match probe_openrouter_through_proxy(input).await {
+        Ok(status) if status == reqwest::StatusCode::UNAUTHORIZED || status.is_success() => {
+            println!(
+                "Proxy reached OpenRouter (HTTP {status}); API-key authentication was not tested."
+            );
+        }
+        Ok(status) => {
+            println!(
+                "Proxy reached an HTTP response from OpenRouter (HTTP {status}); the endpoint or a network policy may have denied the request."
+            );
+        }
+        Err(error) => {
+            println!("Proxy connectivity check failed: {error}");
+        }
+    }
+    Ok(())
+}
+
+fn validate_proxy_url(input: &str) -> Result<(), String> {
+    let url = reqwest::Url::parse(input)
+        .map_err(|_| "enter a valid proxy URL such as http://proxy.example:8080".to_string())?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err("proxy URL must use http:// or https:// and include a host".into());
+    }
+    reqwest::Proxy::all(input)
+        .map(|_| ())
+        .map_err(|_| "proxy URL is invalid or uses an unsupported proxy scheme".into())
+}
+
+fn safe_proxy_label(input: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(input) else {
+        return "configured proxy".into();
+    };
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.to_string()
+}
+
+async fn probe_openrouter_through_proxy(proxy_url: &str) -> Result<reqwest::StatusCode, String> {
+    let proxy =
+        reqwest::Proxy::all(proxy_url).map_err(|_| "invalid proxy configuration".to_string())?;
+    let client = reqwest::Client::builder()
+        .proxy(proxy)
+        .timeout(Duration::from_secs(12))
+        .build()
+        .map_err(|error| format!("creating proxy client: {}", error.without_url()))?;
+    let response = client
+        .get("https://openrouter.ai/api/v1/models")
+        .send()
+        .await
+        .map_err(|error| error.without_url().to_string())?;
+    Ok(response.status())
+}
+
 fn read_provider_key(prompt: &str) -> Result<String, String> {
     print!("{prompt}");
     io::stdout()
@@ -3417,6 +3539,7 @@ Interactive commands:\n\
   :approval          Toggle automatic approval for writes and commands\n\
   :reasoning         Set reasoning effort\n\
   :provider          Add or update an OpenAI-compatible provider\n\
+  :proxy             Configure a proxy for model API requests\n\
   :setting           Configure mode, reasoning, and approvals\n\
   :quit              Exit\n\
 \
