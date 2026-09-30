@@ -653,7 +653,7 @@ async fn chat(options: &Options) -> Result<(), String> {
 fn agent_tools(mode: &str) -> Value {
     let tools = json!([
         {"type":"function","function":{"name":"list_files","description":"List files under a project directory.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Project-relative directory, default ."}},"additionalProperties":false}}},
-        {"type":"function","function":{"name":"read_file","description":"Read a UTF-8 text file in the project.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}}},
+        {"type":"function","function":{"name":"read_file","description":"Read a UTF-8 text file or a line range from it. For long files, read subsequent sections with start_line so you do not repeat the first section.","parameters":{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer","minimum":1,"description":"1-based first line to return; defaults to 1"},"line_count":{"type":"integer","minimum":1,"maximum":300,"description":"Maximum lines to return; defaults to 200"}},"required":["path"],"additionalProperties":false}}},
         {"type":"function","function":{"name":"search_files","description":"Search project text files for a literal string.","parameters":{"type":"object","properties":{"query":{"type":"string"},"path":{"type":"string","description":"Optional project-relative directory, default ."}},"required":["query"],"additionalProperties":false}}},
         {"type":"function","function":{"name":"write_file","description":"Create or replace a project file. Approval depends on Nio settings.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"],"additionalProperties":false}}},
         {"type":"function","function":{"name":"run_command","description":"Run a shell command in the project. Approval depends on Nio settings.","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"],"additionalProperties":false}}}
@@ -1000,8 +1000,54 @@ async fn execute_agent_tool(
             if metadata.len() > 512 * 1024 {
                 return Err("file is larger than the 512 KiB read limit".into());
             }
-            std::fs::read_to_string(&path)
-                .map_err(|e| format!("file is not readable UTF-8 text: {e}"))
+            let contents = std::fs::read_to_string(&path)
+                .map_err(|e| format!("file is not readable UTF-8 text: {e}"))?;
+            let lines = contents.lines().collect::<Vec<_>>();
+            if lines.is_empty() {
+                return Ok(format!("File '{input}' is empty."));
+            }
+            let start = args
+                .get("start_line")
+                .and_then(Value::as_u64)
+                .unwrap_or(1)
+                .saturating_sub(1) as usize;
+            let requested_count = args
+                .get("line_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(200)
+                .clamp(1, 300) as usize;
+            if start >= lines.len() {
+                return Err(format!(
+                    "start_line {} is past the end of this file ({} lines)",
+                    start + 1,
+                    lines.len()
+                ));
+            }
+            let mut excerpt = String::new();
+            let mut end = start;
+            for (index, line) in lines.iter().enumerate().skip(start).take(requested_count) {
+                let row = format!("{line}\n");
+                if excerpt.len() + row.len() > 9_000 {
+                    break;
+                }
+                excerpt.push_str(&row);
+                end = index + 1;
+            }
+            let mut result = format!(
+                "Lines {}-{} of {} in {}:\n{}",
+                start + 1,
+                end,
+                lines.len(),
+                input,
+                excerpt
+            );
+            if end < lines.len() {
+                result.push_str(&format!(
+                    "\n[More lines available. Read the next section with start_line: {}.]",
+                    end + 1
+                ));
+            }
+            Ok(result)
         }
         "search_files" => {
             let query = required_arg(args, "query")?;
@@ -2273,15 +2319,17 @@ fn read_interactive_line_raw(
     let mut history_draft = None::<String>;
     let mut palette = PaletteScreen::new();
     write!(stdout, "\r\n").map_err(|e| format!("writing prompt: {e}"))?;
-    if !suggestions.is_empty() {
+    let first_suggestion_row = if !suggestions.is_empty() {
         write!(stdout, "Follow-ups (click to ask, or type your own):\r\n")
             .map_err(|error| format!("drawing follow-up buttons: {error}"))?;
+        let first_row = position().map(|(_, row)| row).unwrap_or(0);
         draw_followup_buttons(&mut stdout, suggestions)?;
         print_prompt_divider()?;
         write!(stdout, "\r\n").map_err(|error| format!("spacing prompt divider: {error}"))?;
-    }
-    let prompt_row = position().map(|(_, row)| row).unwrap_or(0);
-    let first_suggestion_row = prompt_row.saturating_sub(suggestions.len() as u16);
+        Some(first_row)
+    } else {
+        None
+    };
     draw_input(&mut stdout, prompt, &input)?;
 
     loop {
@@ -2289,9 +2337,12 @@ fn read_interactive_line_raw(
         if let Event::Mouse(mouse) = &event {
             if !palette.active
                 && mouse.kind == MouseEventKind::Down(MouseButton::Left)
-                && mouse.row >= first_suggestion_row
+                && first_suggestion_row.is_some_and(|first_row| {
+                    mouse.row >= first_row
+                        && mouse.row < first_row.saturating_add(suggestions.len() as u16)
+                })
             {
-                let index = (mouse.row - first_suggestion_row) as usize;
+                let index = (mouse.row - first_suggestion_row.unwrap_or_default()) as usize;
                 if let Some(suggestion) = suggestions.get(index) {
                     let suggestion = suggestion.clone();
                     palette.leave(&mut stdout)?;
@@ -2312,12 +2363,32 @@ fn read_interactive_line_raw(
             continue;
         }
 
-        let suggestions = command_suggestions(&input);
+        let command_suggestions = command_suggestions(&input);
         match key.code {
             KeyCode::Enter => {
-                if !suggestions.is_empty() && !COMMANDS.iter().any(|(command, _)| *command == input)
+                if let Some(suggestion) = input
+                    .trim()
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|index| index.checked_sub(1))
+                    .and_then(|index| suggestions.get(index))
                 {
-                    input = suggestions[selected.min(suggestions.len() - 1)].to_string();
+                    let suggestion = suggestion.clone();
+                    palette.leave(&mut stdout)?;
+                    queue!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))
+                        .map_err(|error| format!("selecting follow-up: {error}"))?;
+                    write!(stdout, "You: {suggestion}\r\n")
+                        .map_err(|error| format!("selecting follow-up: {error}"))?;
+                    stdout
+                        .flush()
+                        .map_err(|error| format!("selecting follow-up: {error}"))?;
+                    return Ok(PromptInput::Line(suggestion));
+                }
+                if !command_suggestions.is_empty()
+                    && !COMMANDS.iter().any(|(command, _)| *command == input)
+                {
+                    input = command_suggestions[selected.min(command_suggestions.len() - 1)]
+                        .to_string();
                 }
                 palette.leave(&mut stdout)?;
                 queue!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))
@@ -2336,15 +2407,16 @@ fn read_interactive_line_raw(
                     .map_err(|error| format!("updating prompt: {error}"))?;
                 return Ok(PromptInput::ModeCycle);
             }
-            KeyCode::Tab if !suggestions.is_empty() => {
-                input = suggestions[selected.min(suggestions.len() - 1)].to_string();
+            KeyCode::Tab if !command_suggestions.is_empty() => {
+                input =
+                    command_suggestions[selected.min(command_suggestions.len() - 1)].to_string();
                 selected = 0;
             }
-            KeyCode::Up | KeyCode::Left if palette.active && !suggestions.is_empty() => {
+            KeyCode::Up | KeyCode::Left if palette.active && !command_suggestions.is_empty() => {
                 selected = selected.saturating_sub(1);
             }
-            KeyCode::Down | KeyCode::Right if palette.active && !suggestions.is_empty() => {
-                selected = (selected + 1).min(suggestions.len() - 1);
+            KeyCode::Down | KeyCode::Right if palette.active && !command_suggestions.is_empty() => {
+                selected = (selected + 1).min(command_suggestions.len() - 1);
             }
             KeyCode::Up if !palette.active && !history.is_empty() => {
                 let cursor = match history_cursor {
