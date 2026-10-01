@@ -28,20 +28,20 @@ The executable is at `target/release/nio`.
 If you have Node.js available, launch NioAI instantly with zero manual installation:
 
 ```sh
-npx nio-ai
+npx @nio-labs/nio-ai
 ```
 
 Run one-shot prompts or flags directly:
 
 ```sh
-npx nio-ai run "Explain this project"
-npx nio-ai models --format json
+npx @nio-labs/nio-ai run "Explain this project"
+npx @nio-labs/nio-ai models --format json
 ```
 
 To install globally via npm:
 
 ```sh
-npm install -g nio-ai
+npm install -g @nio-labs/nio-ai
 nio
 ```
 

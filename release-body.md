@@ -16,5 +16,5 @@ curl -fsSL https://raw.githubusercontent.com/nio-labs/nio/main/install.sh | bash
 Or install the npm launcher:
 
 ```sh
-npm install -g nio-ai
+npm install -g @nio-labs/nio-ai
 ```

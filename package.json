@@ -1,7 +1,7 @@
 {
-  "name": "nio-ai",
+  "name": "@nio-labs/nio-ai",
   "version": "0.2.1",
-  "description": "NioAI — A lightweight AI coding agent for the terminal",
+  "description": "NioAI \u2014 A lightweight AI coding agent for the terminal",
   "main": "bin/nio.js",
   "bin": {
     "nio-ai": "bin/nio.js",
@@ -39,5 +39,8 @@
     "screenshots",
     "README.md",
     "LICENSE"
-  ]
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
 }
