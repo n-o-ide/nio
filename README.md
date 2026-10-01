@@ -63,7 +63,7 @@ bash install.sh
 Custom installation options:
 ```sh
 # Pin a specific version
-NIO_VERSION=v0.2.0 curl -fsSL https://raw.githubusercontent.com/nio-labs/nio/main/install.sh | bash
+NIO_VERSION=v0.2.1 curl -fsSL https://raw.githubusercontent.com/nio-labs/nio/main/install.sh | bash
 
 # Custom install path (defaults to ~/.local/bin)
 NIO_INSTALL_DIR=~/.local/bin curl -fsSL https://raw.githubusercontent.com/nio-labs/nio/main/install.sh | bash
@@ -90,6 +90,16 @@ Override the model for one run:
 ```sh
 nio run -m kilo::kilo-auto/free "Explain this project"
 ```
+
+## Screenshots
+
+Inline CLI showing a project analysis in progress:
+
+![NioAI inline CLI](screenshots/nio.png)
+
+Full-screen TUI with the command palette open:
+
+![NioAI full-screen TUI](screenshots/tui.png)
 
 ## Queue messages while working
 

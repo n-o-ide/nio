@@ -1,6 +1,6 @@
 {
   "name": "nio-ai",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "NioAI — A lightweight AI coding agent for the terminal",
   "main": "bin/nio.js",
   "bin": {
@@ -36,6 +36,7 @@
   },
   "files": [
     "bin",
+    "screenshots",
     "README.md",
     "LICENSE"
   ]
