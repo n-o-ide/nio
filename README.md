@@ -63,7 +63,7 @@ bash install.sh
 Custom installation options:
 ```sh
 # Pin a specific version
-NIO_VERSION=v0.1.0 curl -fsSL https://raw.githubusercontent.com/nio-labs/nio/main/install.sh | bash
+NIO_VERSION=v0.2.0 curl -fsSL https://raw.githubusercontent.com/nio-labs/nio/main/install.sh | bash
 
 # Custom install path (defaults to ~/.local/bin)
 NIO_INSTALL_DIR=~/.local/bin curl -fsSL https://raw.githubusercontent.com/nio-labs/nio/main/install.sh | bash
@@ -90,6 +90,50 @@ Override the model for one run:
 ```sh
 nio run -m kilo::kilo-auto/free "Explain this project"
 ```
+
+## Queue messages while working
+
+In the inline CLI, a persistent `queue>` input stays available during a response. The agent continues working while you type. Enter queues the message; unfinished drafts stay available when the response completes. Messages run in order after the current task finishes. Queued messages do not enter model context until they run.
+
+- `F2` or `:queue` — open the queue panel; arrows select, Enter/e edits, Delete/d removes, and p pauses/resumes
+- `:queue edit 2 New message` — replace a pending message
+- `:queue remove 2` / `:queue clear` — remove pending work
+- `:queue pause` / `:queue resume` — control automatic processing
+- `:stop` — stop the response and preserve pending messages
+
+Queue controls work while a response is running. Other commands entered in the inline queue prompt run after the response; the TUI also supports skill commands during a response. Errors and interruptions pause the queue. Pending messages are kept in memory for the running session.
+
+## GitHub skills
+
+Install a skill folder containing `SKILL.md` from a GitHub repository. Git is required. Local folders are not accepted as installation sources.
+
+```sh
+nio --skills
+nio --skills add https://github.com/your-org/your-repo path/to/skill
+nio skills add https://github.com/your-org/your-repo/tree/main/path/to/skill
+nio --skills disable skill-name
+nio --skills enable skill-name
+nio --skills remove skill-name
+```
+
+`nio --skills` defaults to listing installed skills; `nio skills` remains available as an alias. The same operations are available through `:skills` or `/skills` in interactive mode. Installed packages and their enable/disable settings are stored beside the Nio configuration. New installations are enabled by default. The model receives a catalog of enabled skills and can read relevant instructions and supporting text files through `read_skill_file`. Changes affect subsequent requests; skill instructions retain the current mode and approval restrictions.
+
+## Full-screen interface
+
+```sh
+nio --tui
+nio --tui --session SESSION_ID
+```
+
+The optional TUI uses a theme background, a scrollable conversation, and a persistent input area. Enter sends a message when idle and queues it while working. Shift+Enter or Alt+Enter inserts a newline when supported by the terminal. Long pastes use compact markers. Use the mouse wheel/trackpad or Page Up/Down to scroll, and click the input to position the cursor.
+
+`:` and `/` open the command palette. `:setting`, `:mode`, `:model`, `:reasoning`, and `:theme` open selection panels. `:sessions` opens recent saved conversations; `:details` opens the latest diff. Approval prompts use Y/N and D for details. Ctrl+C stops the current work and pauses pending messages. `:quit` saves the session and restores the terminal.
+
+The model picker filters by model name, selector, or provider as you type; Backspace edits the search and Ctrl+U clears it. Arrow navigation updates only changed screen rows.
+
+The theme panel previews each highlighted theme immediately. Enter saves it; Esc restores the saved theme. Available palettes include Tokyo Night and the muted light options Light, Paper, and Cloud.
+
+TUI settings also accept explicit values, such as `:mode build`, `:theme ocean` or `:theme light`, and `:proxy off`. `:provider` displays saved providers; configure provider credentials with `nio provider` in the inline CLI.
 
 ## Configure and run
 
@@ -157,7 +201,7 @@ nio run -m kilo::kilo-auto/free --format json --mode ask --reasoning low \
   --trust-project --dir /path/to/project -s project-chat -- "Explain this project"
 ```
 
-`--trust-project` grants project reads for this invocation. `--no-tools` disables all project discovery and tools, even for remembered trusted folders. `--auto` grants writes and shell commands for a single invocation; noninteractive runs ignore saved automatic approval preferences. Approved commands have the current user's host access; the project directory is their starting directory, not a shell sandbox. `NIO_API_KEY` overrides credentials for the selected chat provider and is not broadcast to model catalogs. Catalogs use provider-specific saved or environment credentials. `--reasoning` accepts low, medium, high, or default. `--file` accepts UTF-8 text attachments, with a combined prompt/attachment limit of 24 KiB. Binary and image attachments are currently unsupported.
+`--trust-project` grants project reads for this invocation. `--no-tools` disables all project discovery and tools, even for remembered trusted folders. `--auto` grants writes and shell commands for a single invocation; noninteractive runs ignore saved automatic approval preferences. Approved commands have the current user's host access; the project directory is their starting directory, not a shell sandbox. `NIO_API_KEY` overrides credentials for the selected chat provider and is not broadcast to model catalogs. Catalogs use provider-specific saved or environment credentials. `--reasoning` accepts low, medium, high, or default. `--file PATH` attaches a UTF-8 text file or a PNG, JPEG, GIF, or WebP image. In prompts, use `@path` or `@{path with spaces}` to attach an existing file; in the regular interactive prompt and `--tui`, an existing absolute path pasted or dropped into the prompt is also attached automatically. `read_file` can read a specific absolute local path when you ask about it, including image files; project-relative reads remain project-scoped. Dropping a supported file into the TUI composer inserts a path reference. Text attachments share a 24 KiB prompt limit; image files may be up to 10 MiB each and 20 MiB total. Images require a vision-capable provider model. PDF and other binary documents are not supported yet.
 
 JSON runs emit a `session` event with `sessionID` immediately, and persist the conversation on completion or handled interruption. Sessions are bound to the canonical project directory and project-access scope, with a lock preventing simultaneous use. Old array-only sessions have no project binding and require starting a new session; their files are preserved.
 

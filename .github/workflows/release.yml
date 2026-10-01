@@ -111,7 +111,7 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
-          generate_release_notes: true
+          body_path: release-body.md
 
       - name: Setup Node for npm publish
         if: ${{ env.NPM_TOKEN != '' }}
