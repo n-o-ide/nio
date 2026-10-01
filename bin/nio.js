@@ -41,7 +41,7 @@ function getPlatformInfo() {
   }
 
   if (!target) {
-    console.error(`[nio-cli] Error: Unsupported platform: ${platform} ${arch}`);
+    console.error(`[nio-ai] Error: Unsupported platform: ${platform} ${arch}`);
     process.exit(1);
   }
 
@@ -57,7 +57,7 @@ function fetchWithRedirects(url, maxRedirects = 5) {
     }
 
     const client = url.startsWith('https:') ? https : http;
-    const req = client.get(url, { headers: { 'User-Agent': `nio-cli-npm/${VERSION}` } }, (res) => {
+    const req = client.get(url, { headers: { 'User-Agent': `nio-ai-npm/${VERSION}` } }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         return resolve(fetchWithRedirects(res.headers.location, maxRedirects - 1));
       }
@@ -88,7 +88,7 @@ async function ensureBinary() {
     if (fs.existsSync(process.env.NIO_BIN)) {
       return process.env.NIO_BIN;
     }
-    console.warn(`[nio-cli] Warning: NIO_BIN set to "${process.env.NIO_BIN}" but file does not exist.`);
+    console.warn(`[nio-ai] Warning: NIO_BIN set to "${process.env.NIO_BIN}" but file does not exist.`);
   }
 
   // 2. Local target build if running inside repo
@@ -139,7 +139,7 @@ async function ensureBinary() {
   const downloadUrl = `${baseUrl}/${archiveName}`;
   const sumsUrl = `${baseUrl}/SHA256SUMS`;
 
-  console.log(`[nio-cli] Downloading NioAI binary (${tag}, ${archiveName})...`);
+  console.log(`[nio-ai] Downloading NioAI binary (${tag}, ${archiveName})...`);
 
   // Fetch SHA256SUMS if available
   let expectedHash = null;
@@ -211,7 +211,7 @@ async function ensureBinary() {
   fs.renameSync(extractedBin, targetBinPath);
   try { fs.rmSync(tempExtractDir, { recursive: true, force: true }); } catch {}
 
-  console.log(`[nio-cli] NioAI binary ready.`);
+  console.log(`[nio-ai] NioAI binary ready.`);
   return targetBinPath;
 }
 
@@ -241,11 +241,11 @@ async function main() {
     });
 
     child.on('error', (err) => {
-      console.error(`[nio-cli] Execution error: ${err.message}`);
+      console.error(`[nio-ai] Execution error: ${err.message}`);
       process.exit(1);
     });
   } catch (err) {
-    console.error(`[nio-cli] Error: ${err.message}`);
+    console.error(`[nio-ai] Error: ${err.message}`);
     process.exit(1);
   }
 }

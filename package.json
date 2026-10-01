@@ -1,10 +1,10 @@
 {
-  "name": "nio-cli",
+  "name": "nio-ai",
   "version": "0.1.0",
   "description": "NioAI — A lightweight AI coding agent for the terminal",
   "main": "bin/nio.js",
   "bin": {
-    "nio-cli": "./bin/nio.js",
+    "nio-ai": "./bin/nio.js",
     "nio": "./bin/nio.js"
   },
   "scripts": {
