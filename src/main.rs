@@ -2721,7 +2721,7 @@ fn emit_assistant_start(options: &Options) -> Result<(), String> {
 
 fn emit_status(options: &Options, status: &str, message: &str) {
     if options.json_output {
-        // NoIDE understands this OpenCode/Kilo-compatible reasoning event.
+        // NioDE understands this OpenCode/Kilo-compatible reasoning event.
         emit_json(
             &json!({"type":"reasoning","part":{"type":"reasoning","text":format!("{status}: {message}")}}),
         );

@@ -197,9 +197,9 @@ Toggle automatic approval for a single run with `--auto`. Set reasoning effort w
 
 NioAI includes no telemetry, analytics, tracking, or background reporting. Network requests only go to features you use: model discovery, provider checks, and responses. Prompts, conversation context, project files, tool results, and approved command output can be sent to the model endpoint. Review your provider's terms before sending sensitive information. Credentials and sessions are stored locally; on Unix they are restricted to your user account. Avoid putting API keys directly in shell history.
 
-## NoIDE integration
+## NioDE integration
 
-NioAI is available as the `nio` agent through NoIDE's direct subprocess route. Install a current native `nio` executable on the server's `PATH`; Nio does not require npm or a persistent agent server. Automatic installation awaits published, verified native release artifacts.
+NioAI is available as the `nio` agent through NioDE's direct subprocess route. Install a current native `nio` executable on the server's `PATH`; Nio does not require npm or a persistent agent server. Automatic installation awaits published, verified native release artifacts.
 
 The Chat UI requests project access before enabling Nio tools. Build consent also grants file edits and shell execution for that conversation/project. Ask and Plan are enforced as read-only. Studio uses `--mode ask --no-tools`; it receives generated text and owns its file writes.
 
