@@ -9,9 +9,12 @@ nio [OPTIONS]                         Start the interactive client
 nio run [OPTIONS] <prompt>            Run one turn
 nio models [--format json]             List available model selectors
 nio provider                           Configure a provider interactively
+nio config                             Inspect or edit saved settings
 nio --help
 nio --version
 ```
+
+`nio config` supports `list`, `get <KEY>`, and `set <KEY> <VALUE>`. Common keys include `model`, `approval`, `reasoning`, `theme`, and `progress-style`.
 
 Options may be placed before or after the prompt. Use `--` before a prompt that begins with `-`.
 
@@ -63,12 +66,12 @@ Project reads, attachments, tool calls, and tool results may be included in requ
 - `NIO_MODEL`: default model selector.
 - `NIO_BASE_URL`: default OpenAI-compatible endpoint for an unqualified model selector.
 - `NIO_API_KEY`: key for that endpoint or selected chat provider.
-- Provider-specific key variables: for example, `OPENROUTER_API_KEY`, `KILO_API_KEY`, `ANTHROPIC_API_KEY`, and `OPENAI_API_KEY`.
 - `NIO_CONFIG`: override the user configuration file path.
 - `NIO_PROXY`: override the saved HTTP(S) proxy for model API requests.
+- Provider-specific key variables: for example, `OPENROUTER_API_KEY`, `KILO_API_KEY`, `ANTHROPIC_API_KEY`, and `OPENAI_API_KEY`.
 
 Without `NIO_CONFIG`, configuration is stored under `$XDG_CONFIG_HOME/nio/config.json` or `$HOME/.config/nio/config.json`. Sessions are stored beside that configuration. On Unix, config and session files are created with user-only permissions. Session IDs are bound to the canonical project directory and project-access scope; simultaneous use of a session is rejected.
 
 ## Resource limits
 
-Current safeguards include bounded project traversal, 512 KiB per file read/write, a 16 MiB search read budget, a 96 KiB serialized context budget, bounded provider responses, request deadlines, and capped retries. Limits and details are maintained in the [README resource section](README.md#resource-and-reliability-limits).
+Current safeguards include bounded project traversal, 512 KiB per file read/write, a 16 MiB search read budget, a 512 KiB serialized context budget, bounded provider responses, request deadlines, and capped retries. Limits and details are maintained in the [README resource section](README.md#resource-and-reliability-limits).

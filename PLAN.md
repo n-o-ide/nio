@@ -14,7 +14,7 @@
 
 ## Version 0.1: Standalone CLI foundation
 
-- **Status:** Complete. The CLI is functional: provider/model selection, project trust, streaming chat, tool calls, file/shell approvals, sessions, JSON output, proxy support, and basic error handling are implemented.
+- **Status:** In progress. The CLI is functional: provider/model selection, project trust, streaming chat, tool calls, file/shell approvals, sessions, JSON output, proxy support, config commands, themes, reasoning effort, and basic error handling are implemented.
 - Provide `nio run`, `nio models`, `nio --help`, and `nio --version`.
 - On first interactive launch, require a model choice, save it as the default, then prompt for the user's first request. Allow `--model`/`NIO_MODEL` to select a model non-interactively.
 - Use OpenAI-compatible streaming chat completions with function/tool calls.
@@ -27,6 +27,8 @@
 **Milestone:** From a project directory, a user can send a prompt to a configured model and see the streamed response in the terminal.
 
 The current implementation provides `nio`, `nio run`, `nio models`, `nio --help`, and `nio --version`. Running `nio` starts a lightweight line UI. The agent automatically gets project overview, list/search/read tools; writes and shell commands require approval by default. OpenAI-compatible model responses stream text and tool calls. `nio run --format json` emits NDJSON events (`reasoning`, `text`, and `tool_use`) that match NoIDE's current chat parser. The NoIDE UI now lists NioAI through a native subprocess adapter. Model listing includes available entries with free models first, labels each model with its gateway, and supplies route-qualified selectors such as `kilo::provider/model`. First launch asks for a model and saves it in Nio's config. Kilo's public free routes support keyless use; OpenRouter is listed when its key is configured. Nio currently does not import credentials from OpenCode or provide account sign-in.
+
+Interactive users can run `:provider`, `:models`, `:mode`, `:reasoning`, `:theme`, `:approval`, `:proxy`, `:bash` or `:command`, `:path` / `:workingpath`, `:diff`, `:undo`, and `:clear`. Headless and scripted users can use `NIO_BASE_URL`, `NIO_API_KEY`, `NIO_PROXY`, `NIO_CONFIG`, `--format json`, `--session`, `--trust-project`, `--no-tools`, `--mode`, `--reasoning`, `--file`, and `--auto`. `nio config` supports `list`, `get <KEY>`, and `set <KEY> <VALUE>`.
 
 ## Version 0.2: Robustness and shell safety
 
@@ -102,6 +104,8 @@ Implemented in the working tree:
 - Unix shell group cleanup and handled noninteractive cancellation.
 - Per-run mode, reasoning, trust, text attachments, JSON model discovery and session metadata.
 - NoTerm native subprocess adapter, Chat consent and mode mapping, tools-disabled Studio, and ordered output completion.
+- Interactive configuration commands and persisted settings for model, approval, reasoning, theme, progress style, proxy, and provider credentials.
+- Shell-safety warnings for obviously destructive commands, with an explicit override path.
 
 Validation scope: compilation and frontend type checking. Live provider,
 interactive terminal, cancellation, and cross-platform behavior still need

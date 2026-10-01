@@ -1,0 +1,42 @@
+{
+  "name": "nio-cli",
+  "version": "0.1.0",
+  "description": "NioAI — A lightweight AI coding agent for the terminal",
+  "main": "bin/nio.js",
+  "bin": {
+    "nio-cli": "./bin/nio.js",
+    "nio": "./bin/nio.js"
+  },
+  "scripts": {
+    "start": "node ./bin/nio.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/n-o-ide/nio.git"
+  },
+  "keywords": [
+    "nio",
+    "nio-cli",
+    "nioai",
+    "ai",
+    "agent",
+    "coding-agent",
+    "cli",
+    "llm",
+    "terminal"
+  ],
+  "author": "NioAI Team",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/n-o-ide/nio/issues"
+  },
+  "homepage": "https://github.com/n-o-ide/nio#readme",
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "files": [
+    "bin",
+    "README.md",
+    "LICENSE"
+  ]
+}

@@ -1,0 +1,132 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: nio-x86_64-unknown-linux-gnu.tar.gz
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive: nio-aarch64-unknown-linux-gnu.tar.gz
+          - os: macos-15
+            target: aarch64-apple-darwin
+            archive: nio-aarch64-apple-darwin.tar.gz
+          - os: macos-15
+            target: x86_64-apple-darwin
+            archive: nio-x86_64-apple-darwin.tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: nio-x86_64-pc-windows-msvc.zip
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build binary
+        run: |
+          if [ "${{ matrix.target }}" = "x86_64-apple-darwin" ]; then
+            rustup target add x86_64-apple-darwin
+            cargo build --release --locked --target x86_64-apple-darwin
+            DIR="target/x86_64-apple-darwin/release"
+          else
+            cargo build --release --locked
+            DIR="target/release"
+          fi
+
+          mkdir -p dist
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cp "$DIR/nio.exe" dist/
+            cd dist && 7z a "../${{ matrix.archive }}" nio.exe && cd ..
+          else
+            cp "$DIR/nio" dist/
+            tar -czf "${{ matrix.archive }}" -C dist nio
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ matrix.archive }}
+          if-no-files-found: error
+
+  checksums:
+    name: checksums
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        working-directory: artifacts
+        run: sha256sum nio-* | tee SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: checksums
+          path: artifacts/SHA256SUMS
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    needs: checksums
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Verify artifacts
+        working-directory: dist
+        run: |
+          test -f SHA256SUMS
+          test -f nio-x86_64-unknown-linux-gnu.tar.gz
+          test -f nio-aarch64-unknown-linux-gnu.tar.gz
+          test -f nio-aarch64-apple-darwin.tar.gz
+          test -f nio-x86_64-apple-darwin.tar.gz
+          test -f nio-x86_64-pc-windows-msvc.zip
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+
+      - name: Setup Node for npm publish
+        if: ${{ env.NPM_TOKEN != '' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: 'https://registry.npmjs.org'
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Publish to npm
+        if: ${{ env.NPM_TOKEN != '' }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+          npm publish --access public

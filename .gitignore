@@ -6,3 +6,4 @@
 /.nio/
 *.log
 .DS_Store
+.*.nio.lock

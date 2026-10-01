@@ -10,8 +10,11 @@ pub const FILE_LIMIT: usize = 512 * 1024;
 pub const RESPONSE_LIMIT: usize = 2 * 1024 * 1024;
 pub const EVENT_LIMIT: usize = 1024 * 1024;
 pub const TOOL_LIMIT: usize = 16;
-pub const STEP_LIMIT: usize = 24;
-pub const CONTEXT_LIMIT: usize = 96 * 1024;
+pub const STEP_LIMIT: usize = 128;
+// A request is measured as serialized JSON bytes, which is substantially
+// smaller than the token limit advertised by current hosted models. Keep a
+// generous local ceiling while leaving room for the provider's output budget.
+pub const CONTEXT_LIMIT: usize = 512 * 1024;
 static TEMP_ID: AtomicUsize = AtomicUsize::new(0);
 
 pub fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>, String> {
@@ -382,6 +385,118 @@ pub fn preview_summary(path: &str, old: &[u8], new: &str) -> String {
     )
 }
 
+/// A plain unified diff, with matching lines retained instead of treating
+/// everything between the first and last changed lines as a replacement.
+pub fn edit_report(path: &str, old: &[u8], new: &str) -> String {
+    if old == new.as_bytes() {
+        return format!("No changes to {path}; content already matches.");
+    }
+    let old = String::from_utf8_lossy(old);
+    let before: Vec<_> = old.lines().collect();
+    let after: Vec<_> = new.lines().collect();
+    let (prefix, old_end, new_end) = changed_line_ranges(&before, &after);
+    let left = &before[prefix..old_end];
+    let right = &after[prefix..new_end];
+    let mut operations = before[..prefix]
+        .iter()
+        .map(|line| (' ', *line))
+        .collect::<Vec<_>>();
+    let columns = right.len() + 1;
+    // Bound the matrix for very large replacements; common single-block edits
+    // have a small middle after trimming the unchanged prefix and suffix.
+    if (left.len() + 1).saturating_mul(columns) <= 1_000_000 {
+        let mut lengths = vec![0u32; (left.len() + 1) * columns];
+        for i in (0..left.len()).rev() {
+            for j in (0..right.len()).rev() {
+                lengths[i * columns + j] = if left[i] == right[j] {
+                    lengths[(i + 1) * columns + j + 1] + 1
+                } else {
+                    lengths[(i + 1) * columns + j].max(lengths[i * columns + j + 1])
+                };
+            }
+        }
+        let (mut i, mut j) = (0, 0);
+        while i < left.len() || j < right.len() {
+            if i < left.len() && j < right.len() && left[i] == right[j] {
+                operations.push((' ', left[i]));
+                i += 1;
+                j += 1;
+            } else if i < left.len()
+                && (j == right.len()
+                    || lengths[(i + 1) * columns + j] >= lengths[i * columns + j + 1])
+            {
+                operations.push(('-', left[i]));
+                i += 1;
+            } else {
+                operations.push(('+', right[j]));
+                j += 1;
+            }
+        }
+    } else {
+        operations.extend(left.iter().map(|line| ('-', *line)));
+        operations.extend(right.iter().map(|line| ('+', *line)));
+    }
+    operations.extend(before[old_end..].iter().map(|line| (' ', *line)));
+    let additions = operations.iter().filter(|(kind, _)| *kind == '+').count();
+    let removals = operations.iter().filter(|(kind, _)| *kind == '-').count();
+    if additions == 0 && removals == 0 {
+        return format!("Updated {path} (line endings or final newline changed).");
+    }
+    let mut result = format!(
+        "Edited {path} (+{additions} -{removals})\ndiff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n"
+    );
+    let mut ranges = Vec::<(usize, usize)>::new();
+    for (index, (kind, _)) in operations.iter().enumerate() {
+        if *kind == ' ' {
+            continue;
+        }
+        let start = index.saturating_sub(3);
+        let end = (index + 4).min(operations.len());
+        if let Some(last) = ranges.last_mut().filter(|last| start <= last.1) {
+            last.1 = last.1.max(end);
+        } else {
+            ranges.push((start, end));
+        }
+    }
+    let mut positions = vec![(1usize, 1usize)];
+    for (kind, _) in &operations {
+        let (old, new) = *positions.last().unwrap();
+        positions.push((
+            old + usize::from(*kind != '+'),
+            new + usize::from(*kind != '-'),
+        ));
+    }
+    for (start, end) in ranges {
+        let (old_start, new_start) = positions[start];
+        let old_count = positions[end].0 - old_start;
+        let new_count = positions[end].1 - new_start;
+        result.push_str(&format!(
+            "@@ -{},{} +{},{} @@\n",
+            if old_count == 0 {
+                old_start - 1
+            } else {
+                old_start
+            },
+            old_count,
+            if new_count == 0 {
+                new_start - 1
+            } else {
+                new_start
+            },
+            new_count
+        ));
+        for (kind, line) in &operations[start..end] {
+            result.push(*kind);
+            result.extend(
+                line.chars()
+                    .filter(|character| !character.is_control() || *character == '\t'),
+            );
+            result.push('\n');
+        }
+    }
+    result
+}
+
 pub fn preview_replacement(
     path: &str,
     original: &str,
@@ -499,8 +614,14 @@ pub fn apply_patch(
                 "old_content matches {norm_count} locations in the file; please include more surrounding context to disambiguate"
             ));
         }
+        let norm_new = new_content.replace("\r\n", "\n");
+        if !norm_new.trim().is_empty() && norm_file.matches(&norm_new).count() == 1 {
+            // A repeated patch may target a block that an earlier call already
+            // replaced. Preserve the original bytes, including line endings.
+            return Ok(file_content.to_string());
+        }
         return Err(
-            "old_content was not found in the file; ensure indentation, whitespace, and line breaks match exactly"
+            "old_content was not found in the current file; read_file again and retry using the latest exact content, including whitespace and line breaks"
                 .to_string(),
         );
     }
@@ -523,6 +644,12 @@ static BACKUP_STACK: std::sync::Mutex<Vec<BackupEntry>> = std::sync::Mutex::new(
 pub fn record_backup(path: PathBuf, original: Option<Vec<u8>>) {
     if let Ok(mut stack) = BACKUP_STACK.lock() {
         stack.push(BackupEntry { path, original });
+    }
+}
+
+pub fn clear_backups() {
+    if let Ok(mut stack) = BACKUP_STACK.lock() {
+        stack.clear();
     }
 }
 
@@ -602,7 +729,8 @@ impl Drop for CommandGuard {
 #[cfg(test)]
 mod tests {
     use super::{
-        atomic_write, atomic_write_project, optional_read, preview, read_bounded, trim_history,
+        atomic_write, atomic_write_project, optional_read, preview_for_path, read_bounded,
+        trim_history,
     };
     use serde_json::json;
     use std::path::PathBuf;
