@@ -1,7 +1,7 @@
 # NioAI installer for Windows PowerShell
 $ErrorActionPreference = "Stop"
 
-$Repo = "n-o-ide/nio"
+$Repo = "nio-labs/nio"
 $InstallDir = if ($env:NIO_INSTALL_DIR) { $env:NIO_INSTALL_DIR } else { "$env:LOCALAPPDATA\Programs\Nio" }
 
 Write-Host "📦 NioAI Windows Installer" -ForegroundColor Cyan

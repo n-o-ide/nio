@@ -10,7 +10,7 @@ const { spawn, execSync } = require('child_process');
 
 const pkg = require('../package.json');
 const VERSION = pkg.version;
-const REPO = 'n-o-ide/nio';
+const REPO = 'nio-labs/nio';
 
 function getPlatformInfo() {
   const platform = os.platform();

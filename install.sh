@@ -2,7 +2,7 @@
 # NioAI installer for Linux, macOS, and Termux
 set -eu
 
-REPO="n-o-ide/nio"
+REPO="nio-labs/nio"
 DEFAULT_BIN_DIR="$HOME/.local/bin"
 
 cleanup() {

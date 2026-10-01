@@ -50,12 +50,12 @@ nio
 Install the pre-built native binary via `curl`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/n-o-ide/nio/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/nio-labs/nio/main/install.sh | bash
 ```
 
 Prefer inspecting the script before piping to shell?
 ```sh
-curl -fsSL https://raw.githubusercontent.com/n-o-ide/nio/main/install.sh -o install.sh
+curl -fsSL https://raw.githubusercontent.com/nio-labs/nio/main/install.sh -o install.sh
 less install.sh
 bash install.sh
 ```
@@ -63,16 +63,16 @@ bash install.sh
 Custom installation options:
 ```sh
 # Pin a specific version
-NIO_VERSION=v0.1.0 curl -fsSL https://raw.githubusercontent.com/n-o-ide/nio/main/install.sh | bash
+NIO_VERSION=v0.1.0 curl -fsSL https://raw.githubusercontent.com/nio-labs/nio/main/install.sh | bash
 
 # Custom install path (defaults to ~/.local/bin)
-NIO_INSTALL_DIR=~/.local/bin curl -fsSL https://raw.githubusercontent.com/n-o-ide/nio/main/install.sh | bash
+NIO_INSTALL_DIR=~/.local/bin curl -fsSL https://raw.githubusercontent.com/nio-labs/nio/main/install.sh | bash
 ```
 
 ### Windows (PowerShell)
 
 ```powershell
-irm https://raw.githubusercontent.com/n-o-ide/nio/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/nio-labs/nio/main/install.ps1 | iex
 ```
 
 See [INSTALL_PLAN.md](INSTALL_PLAN.md) for supported native platform targets and verification plans.
@@ -175,5 +175,5 @@ JSON runs emit a `session` event with `sessionID` immediately, and persist the c
 
 - Language: Rust
 - Default provider: Kilo
-- Repository: https://github.com/n-o-ide/nio
+- Repository: https://github.com/nio-labs/nio
 - License: [MIT](LICENSE)
