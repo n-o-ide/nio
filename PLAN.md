@@ -2,13 +2,13 @@
 
 **Product:** NioAI
 **Command:** `nio`
-**Purpose:** A lightweight, standalone AI coding agent for terminals, including small Linux systems and Android/Termux. NoIDE is one optional client of NioAI, not a runtime requirement.
+**Purpose:** A lightweight, standalone AI coding agent for terminals, including small Linux systems and Android/Termux. NioDE is one optional client of NioAI, not a runtime requirement.
 
 ## Product principles
 
 - Keep the default installation and runtime small.
 - Use hosted model APIs through configurable provider routes; do not promise that any model or provider will remain free.
-- Keep the core agent independent of NoIDE and individual providers.
+- Keep the core agent independent of NioDE and individual providers.
 - Ask before applying file changes or running commands that need approval.
 - Document the CLI and streaming interfaces so other tools can integrate with NioAI.
 
@@ -21,12 +21,12 @@
 - Use anonymous calls only when the provider permits them.
 - Provide a small line-based interactive UI with progress updates and a persistent in-process conversation; avoid a full-screen TUI dependency in the lightweight core.
 - Let the agent list, search, and read project files automatically. Ask before writes and shell commands unless auto-approval is explicitly selected.
-- Emit NDJSON events compatible with NoIDE's existing reasoning, text, and tool-use stream parser.
+- Emit NDJSON events compatible with NioDE's existing reasoning, text, and tool-use stream parser.
 - Build a foundation that can later support tools, modes, sessions, and additional routes.
 
 **Milestone:** From a project directory, a user can send a prompt to a configured model and see the streamed response in the terminal.
 
-The current implementation provides `nio`, `nio run`, `nio models`, `nio --help`, and `nio --version`. Running `nio` starts a lightweight line UI. The agent automatically gets project overview, list/search/read tools; writes and shell commands require approval by default. OpenAI-compatible model responses stream text and tool calls. `nio run --format json` emits NDJSON events (`reasoning`, `text`, and `tool_use`) that match NoIDE's current chat parser. The NoIDE UI now lists NioAI through a native subprocess adapter. Model listing includes available entries with free models first, labels each model with its gateway, and supplies route-qualified selectors such as `kilo::provider/model`. First launch asks for a model and saves it in Nio's config. Kilo's public free routes support keyless use; OpenRouter is listed when its key is configured. Nio currently does not import credentials from OpenCode or provide account sign-in.
+The current implementation provides `nio`, `nio run`, `nio models`, `nio --help`, and `nio --version`. Running `nio` starts a lightweight line UI. The agent automatically gets project overview, list/search/read tools; writes and shell commands require approval by default. OpenAI-compatible model responses stream text and tool calls. `nio run --format json` emits NDJSON events (`reasoning`, `text`, and `tool_use`) that match NioDE's current chat parser. The NioDE UI now lists NioAI through a native subprocess adapter. Model listing includes available entries with free models first, labels each model with its gateway, and supplies route-qualified selectors such as `kilo::provider/model`. First launch asks for a model and saves it in Nio's config. Kilo's public free routes support keyless use; OpenRouter is listed when its key is configured. Nio currently does not import credentials from OpenCode or provide account sign-in.
 
 Interactive users can run `:provider`, `:models`, `:mode`, `:reasoning`, `:theme`, `:approval`, `:proxy`, `:bash` or `:command`, `:path` / `:workingpath`, `:diff`, `:undo`, and `:clear`. Headless and scripted users can use `NIO_BASE_URL`, `NIO_API_KEY`, `NIO_PROXY`, `NIO_CONFIG`, `--format json`, `--session`, `--trust-project`, `--no-tools`, `--mode`, `--reasoning`, `--file`, and `--auto`. `nio config` supports `list`, `get <KEY>`, and `set <KEY> <VALUE>`.
 
@@ -61,8 +61,8 @@ Interactive users can run `:provider`, `:models`, `:mode`, `:reasoning`, `:theme
 ## Version 0.6: Integration interfaces
 
 - Version and publish the NDJSON stream contract in `STREAM.md`.
-- Add cancellation and NoIDE session integration.
-- Keep NoIDE-specific behavior outside the core CLI.
+- Add cancellation and NioDE session integration.
+- Keep NioDE-specific behavior outside the core CLI.
 
 ## Version 1.0: Public release
 
@@ -78,13 +78,13 @@ These are candidate directions, prioritized from user feedback; they are not rel
 1. **1.1 — Reliability:** session recovery, clearer tool output, interruption handling, and configuration diagnostics.
 2. **1.2 — Repository awareness:** improved context selection, Git status/diff summaries, and large-repository handling.
 3. **1.3 — Provider flexibility:** provider presets, model discovery, per-task model selection, and configurable fallback.
-4. **1.4 — Integrations:** mature NoIDE support and optional agent protocols such as ACP where useful.
+4. **1.4 — Integrations:** mature NioDE support and optional agent protocols such as ACP where useful.
 5. **1.5 — Optional tools:** opt-in MCP, language-server features, and user-defined tool packs.
 6. **2.0 — Longer workflows:** optional subagents and multi-step task workflows, while preserving a small default install.
 
 ## Implementation choice
 
-The initial implementation uses Rust because it is available in the workspace, NoIDE's server is Rust, and Rust can produce a standalone binary suitable for constrained devices. Keep dependencies focused and revisit the choice if Termux packaging or binary size becomes a problem.
+The initial implementation uses Rust because it is available in the workspace, NioDE's server is Rust, and Rust can produce a standalone binary suitable for constrained devices. Keep dependencies focused and revisit the choice if Termux packaging or binary size becomes a problem.
 
 ## Decisions still needed before public release
 
@@ -92,7 +92,7 @@ The initial implementation uses Rust because it is available in the workspace, N
 - Set supported minimum OS versions and release targets.
 - Version the NDJSON event schema before external integrations depend on it.
 
-## Current enhancement milestone: native NoIDE integration
+## Current enhancement milestone: native NioDE integration
 
 Implemented in the working tree:
 

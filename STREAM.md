@@ -1,6 +1,6 @@
 # NioAI stream events
 
-`nio run --format json` writes one JSON object per line to stdout. Provider text is streamed as it arrives. Status and tool events use the event shapes already handled by NoIDE's chat stream parser.
+`nio run --format json` writes one JSON object per line to stdout. Provider text is streamed as it arrives. Status and tool events use the event shapes already handled by NioDE's chat stream parser.
 
 ## Progress
 
