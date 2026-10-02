@@ -1,27 +1,21 @@
-# NioAI 0.3.0
+# NioAI 0.3.1
 
-## Highlights
+## Fix
 
-- **Project search:** `find_files` supports glob filters; `search_code` adds literal/regex queries, numbered context, and pagination with bounded results.
-- **Read web pages:** `web_fetch` reads supplied HTTP(S) URLs without a search API key. HTML is converted to text; browser interaction and JavaScript execution are unsupported.
-- **Clarification:** `ask_user` asks a focused question and waits for your next message.
-- **Terminal sessions:** start approved commands in Build mode, read incremental output, and cancel sessions. Commands stop when Nio exits.
-- **Terminal Markdown:** render `*italics*` and streamed tables with bold/italic cell formatting while preserving code literals.
-- **Host integration:** `--no-project-tools` enables page reading, questions, and skills without project file or shell tools. Studio and Canvas use this mode.
-- **Simpler setup:** web search and its Brave/SearXNG configuration have been removed.
+- Delay the assistant label until visible text arrives. Tool-only responses containing whitespace no longer show empty `nio:` replies.
+- Keep working status visible while Markdown tables and other formatting are buffered.
+- Preserve leading styles and render tables that finish at the end of a response.
 
-- **Clearer path errors:** project search reports the requested path and active project, with guidance for selecting another project.
+Includes the bounded project search, URL reading, clarification, terminal sessions, Markdown improvements, and Studio/Canvas integration introduced in v0.3.0. `web_fetch` needs no search API key; web search remains removed.
 
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/nio-labs/nio/main/install.sh | NIO_VERSION=v0.3.0 bash
+curl -fsSL https://raw.githubusercontent.com/nio-labs/nio/main/install.sh | NIO_VERSION=v0.3.1 bash
 ```
 
-Or install the npm launcher once published:
+Or, once the npm package is published:
 
 ```sh
-npm install -g @nio-labs/nio-ai@0.3.0
+npm install -g @nio-labs/nio-ai@0.3.1
 ```
-
-Release assets include Linux (x64/ARM64), macOS (Intel/Apple silicon), Windows (x64), and SHA256 checksums.

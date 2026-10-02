@@ -1763,6 +1763,8 @@ const RESPONSE_INDENT_WIDTH: usize = 8;
 struct MarkdownFormatter {
     enabled: bool,
     pending: String,
+    leading_output: String,
+    output_started: bool,
     bold: bool,
     italic: bool,
     wrap_width: usize,
@@ -1994,6 +1996,8 @@ impl MarkdownFormatter {
         Self {
             enabled,
             pending: String::new(),
+            leading_output: String::new(),
+            output_started: false,
             bold: false,
             italic: false,
             wrap_width,
@@ -2015,7 +2019,20 @@ impl MarkdownFormatter {
             return text.to_string();
         }
         self.pending.push_str(text);
-        self.drain(false)
+        let output = self.drain(false);
+        self.visible_output(output)
+    }
+
+    fn visible_output(&mut self, output: String) -> String {
+        if self.output_started {
+            return output;
+        }
+        self.leading_output.push_str(&output);
+        if strip_terminal_ansi(&self.leading_output).trim().is_empty() {
+            return String::new();
+        }
+        self.output_started = true;
+        std::mem::take(&mut self.leading_output)
     }
 
     fn finish(&mut self) -> String {
@@ -2057,7 +2074,7 @@ impl MarkdownFormatter {
             output.push_str("\x1b[0m");
             self.in_inline_code = false;
         }
-        output
+        self.visible_output(output)
     }
 
     fn drain(&mut self, flush_partial: bool) -> String {
@@ -2737,16 +2754,16 @@ fn process_sse_line(
             *finished = Some(reason);
         }
         if let Some(content) = choice.delta.content {
-            if !content.is_empty() && !*response_started {
-                emit_assistant_start(options)?;
-                *response_started = true;
-            }
             if answer.len() + content.len() > RESPONSE_LIMIT {
                 return Err("response text exceeded the 2 MiB limit".into());
             }
             answer.push_str(&content);
             let formatted = formatter.push(&content);
             if !formatted.is_empty() {
+                if !*response_started && !strip_terminal_ansi(&formatted).trim().is_empty() {
+                    emit_assistant_start(options)?;
+                    *response_started = true;
+                }
                 emit_text(options, &formatted)?;
             }
         }
@@ -2795,11 +2812,13 @@ fn process_json_completion(
         .or_else(|| choice.get("text").and_then(Value::as_str))
     {
         if !content.is_empty() {
-            emit_assistant_start(options)?;
-            *response_started = true;
             answer.push_str(content);
             let formatted = formatter.push(content);
             if !formatted.is_empty() {
+                if !*response_started && !strip_terminal_ansi(&formatted).trim().is_empty() {
+                    emit_assistant_start(options)?;
+                    *response_started = true;
+                }
                 emit_text(options, &formatted)?;
             }
         }
@@ -4504,6 +4523,10 @@ async fn run_agent_turn_inner(
         }
         let formatted_tail = formatter.finish();
         if !formatted_tail.is_empty() {
+            if !response_started && !strip_terminal_ansi(&formatted_tail).trim().is_empty() {
+                emit_assistant_start(options)?;
+                response_started = true;
+            }
             emit_text(options, &formatted_tail)?;
         }
         let calls = pending_tools
@@ -4589,7 +4612,7 @@ async fn run_agent_turn_inner(
                 })
             })
             .collect::<Vec<_>>();
-        let assistant = json!({"role":"assistant", "content":if answer.is_empty() { Value::Null } else { json!(answer) }, "tool_calls":tool_call_messages});
+        let assistant = json!({"role":"assistant", "content":if answer.trim().is_empty() { Value::Null } else { json!(answer) }, "tool_calls":tool_call_messages});
         messages.push(assistant.clone());
         history.push(assistant);
         let mut tool_images_to_send = Vec::new();
@@ -10007,6 +10030,36 @@ mod markdown_tests {
                 .iter()
                 .all(|line| terminal_text_width(line) == terminal_text_width(lines[0]))
         );
+    }
+
+    #[test]
+    fn whitespace_and_buffered_tables_do_not_start_an_empty_response() {
+        let mut formatter = MarkdownFormatter::new(true);
+        assert_eq!(formatter.push("\n  \n"), "");
+        assert_eq!(formatter.finish(), "");
+        assert!(!formatter.output_started);
+        let mut table = MarkdownFormatter::new(true);
+        assert_eq!(table.push("| Header |\n|---|\n| **value** |\n"), "");
+        assert!(!table.output_started);
+        assert!(table.finish().contains("value"));
+        assert!(table.output_started);
+        let mut styled = MarkdownFormatter::new(true);
+        assert_eq!(styled.push("**"), "");
+        assert!(styled.push("value**").contains("\x1b[1mvalue\x1b[22m"));
+    }
+
+    #[test]
+    fn whitespace_only_tool_completion_does_not_start_a_response_label() {
+        let mut options = default_options("run");
+        options.json_output = true;
+        let mut answer = String::new();
+        let mut tools = std::collections::BTreeMap::new();
+        let mut started = false;
+        let mut formatter = MarkdownFormatter::new(true);
+        process_json_completion(json!({"choices":[{"finish_reason":"tool_calls","message":{"content":"\n\n ","tool_calls":[{"id":"t1","function":{"name":"git_status","arguments":"{}"}}]}}]}), &options, &mut answer, &mut tools, &mut started, &mut formatter).unwrap();
+        assert!(!started);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(formatter.finish(), "");
     }
 
     #[test]

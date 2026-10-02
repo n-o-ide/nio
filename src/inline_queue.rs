@@ -155,9 +155,13 @@ impl Live {
     }
     fn flush_partial(&mut self) -> Result<(), String> {
         if let Some(mut formatter) = self.formatter.take() {
+            let started = formatter.output_started;
+            let tail = formatter.finish();
+            if !started && !tail.is_empty() {
+                self.pending.push_str(ASSISTANT_PREFIX);
+            }
             self.pending.push_str(
-                &String::from_utf8(indent_response_lines(&formatter.finish(), "\r\n"))
-                    .unwrap_or_default(),
+                &String::from_utf8(indent_response_lines(&tail, "\r\n")).unwrap_or_default(),
             );
         }
         if !self.pending.is_empty() {
@@ -169,9 +173,13 @@ impl Live {
     fn stream(&mut self, text: &str) -> Result<(), String> {
         if self.formatter.is_none() {
             self.formatter = Some(MarkdownFormatter::new(true));
+        }
+        let formatter = self.formatter.as_mut().unwrap();
+        let started = formatter.output_started;
+        let formatted = formatter.push(text);
+        if !started && !formatted.is_empty() {
             self.pending.push_str(ASSISTANT_PREFIX);
         }
-        let formatted = self.formatter.as_mut().unwrap().push(text);
         self.pending.push_str(
             &String::from_utf8(indent_response_lines(&formatted, "\r\n")).unwrap_or_default(),
         );
