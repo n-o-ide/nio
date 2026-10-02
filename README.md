@@ -10,9 +10,18 @@ Use `nio --version`, `nio -v`, or `nio --v` to print the installed version.
 
 ## Features
 
-| **Work in Ask, Plan, or Build mode**<br><br>Choose how much autonomy Nio should use, from read-only guidance to making changes. | **Use your preferred model**<br><br>Connect to configurable OpenAI-compatible providers, with model discovery and provider presets. | **Work directly in your project**<br><br>Search, read, and edit project files, or run approved shell commands from the terminal. |
-| --- | --- | --- |
-| **Keep work moving with a queue**<br><br>Queue follow-up requests while Nio is working. | **Pick your terminal interface**<br><br>Use the inline CLI or switch to the full-screen TUI. | **Resume and extend conversations**<br><br>Save sessions, stream JSON events, and add GitHub skills. |
+<table>
+  <tr>
+    <td align="left" valign="top"><strong>Work in Ask, Plan, or Build mode</strong><br><br>Choose how much autonomy Nio should use, from read-only guidance to making changes.</td>
+    <td align="left" valign="top"><strong>Use your preferred model</strong><br><br>Connect to configurable OpenAI-compatible providers, with model discovery and provider presets.</td>
+    <td align="left" valign="top"><strong>Work directly in your project</strong><br><br>Search, read, and edit project files, or run approved shell commands from the terminal.</td>
+  </tr>
+  <tr>
+    <td align="left" valign="top"><strong>Keep work moving with a queue</strong><br><br>Queue follow-up requests while Nio is working.</td>
+    <td align="left" valign="top"><strong>Pick your terminal interface</strong><br><br>Use the inline CLI or switch to the full-screen TUI.</td>
+    <td align="left" valign="top"><strong>Resume and extend conversations</strong><br><br>Save sessions, stream JSON events, and add GitHub skills.</td>
+  </tr>
+</table>
 
 ## Requirements
 
