@@ -8,6 +8,31 @@ An older, separate NIO platform also provides a `nio` command. If both are insta
 
 Use `nio --version`, `nio -v`, or `nio --v` to print the installed version.
 
+## Features
+
+```mermaid
+flowchart TD
+    Nio[NioAI coding agent]
+    Nio --> Work[Agent workflow]
+    Work --> Modes[Ask, Plan, and Build modes]
+    Work --> Tools[Project tools and shell commands]
+    Work --> Trust[Project trust and approval controls]
+    Nio --> Models[Models and providers]
+    Models --> Compatible[OpenAI-compatible endpoints]
+    Models --> Catalog[Model discovery and provider presets]
+    Nio --> Interfaces[Terminal interfaces]
+    Interfaces --> Inline[Inline CLI]
+    Interfaces --> TUI[Full-screen TUI]
+    Nio --> Sessions[Sessions and output]
+    Sessions --> Resume[Save and resume conversations]
+    Sessions --> JSON[JSON event stream]
+    Nio --> Extend[Extensions and integration]
+    Extend --> Skills[GitHub skills]
+    Extend --> Hosts[NioDE and other host integrations]
+```
+
+The diagram summarizes the main capabilities. See the sections below for commands, settings, and limits.
+
 ## Requirements
 
 - Rust toolchain to build from source
