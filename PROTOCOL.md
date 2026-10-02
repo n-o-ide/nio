@@ -28,6 +28,7 @@ Options may be placed before or after the prompt. Use `--` before a prompt that 
 | `--format json` | Emit newline-delimited JSON chat events on stdout. `text` and `human` select normal output. |
 | `--trust-project` | Grant project access for this invocation without the interactive trust prompt. |
 | `--no-tools` | Disable project discovery and all agent tools. |
+| `--no-project-tools` | Allow web research, clarification questions, and skill reading without project file or shell access. |
 | `--mode ask\|plan\|build` | Select the turn mode. Ask and Plan do not expose write or command tools. |
 | `--reasoning low\|medium\|high\|default` | Set provider reasoning effort when supported. |
 | `--file PATH` | Attach UTF-8 text to the prompt. Combined prompt and attachment size is limited to 24 KiB. |
@@ -55,7 +56,7 @@ Errors and human-facing diagnostics go to stderr. A successful completed turn ex
 
 ## Project access and approvals
 
-Interactive use asks before trusting a new project folder. Trust allows project reads; it does not approve writes or commands. Headless runs do not prompt for project trust. Hosts that have collected consent can use `--trust-project`, and should use `--no-tools` when project access is not part of the interaction.
+Interactive use asks before trusting a new project folder. Trust allows project reads; it does not approve writes or commands. Headless runs do not prompt for project trust. Hosts that have collected consent can use `--trust-project`, and should use `--no-project-tools` when project access is not part of the interaction. Use `--no-tools` to disable all tools.
 
 Ask and Plan only expose list, search, and read tools. Build can also request file writes and shell commands. Writes and commands require approval unless `--auto` is supplied. Saved interactive approval settings do not enable automatic approval for headless runs.
 

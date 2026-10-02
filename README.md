@@ -6,7 +6,17 @@ NioAI is a lightweight, open source AI coding agent for the terminal. The execut
 
 An older, separate NIO platform also provides a `nio` command. If both are installed, use the full executable path or adjust `PATH`.
 
+Current release: [v0.3.0](https://github.com/nio-labs/nio/releases/tag/v0.3.0).
+
 Use `nio --version`, `nio -v`, or `nio --v` to print the installed version.
+
+## What’s new in v0.3.0
+
+- Find files by glob and search code with literal or regex queries, numbered context, and pagination.
+- Read supplied web URLs with `web_fetch`, without a search service or search API key.
+- Ask focused clarification questions and manage approved terminal commands with incremental output.
+- Render italics and streamed tables, including bold and italic table cells.
+- Allow URL reading and questions in Studio and Canvas while project tools are disabled.
 
 ## Features
 
@@ -78,10 +88,10 @@ bash install.sh
 Custom installation options:
 ```sh
 # Pin a specific version
-NIO_VERSION=v0.2.1 curl -fsSL https://raw.githubusercontent.com/nio-labs/nio/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/nio-labs/nio/main/install.sh | NIO_VERSION=v0.3.0 bash
 
 # Custom install path (defaults to ~/.local/bin)
-NIO_INSTALL_DIR=~/.local/bin curl -fsSL https://raw.githubusercontent.com/nio-labs/nio/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/nio-labs/nio/main/install.sh | NIO_INSTALL_DIR="$HOME/.local/bin" bash
 ```
 
 ### Windows (PowerShell)
@@ -179,7 +189,21 @@ Presets include OpenRouter, OrcaRouter, AIHubMix, Groq, Cerebras, Gemini, DeepSe
 
 File tools stay inside the current directory. Auto-discovery skips generated folders, secret filenames, and `.gitignore` paths. Individual reads and writes are capped at 512 KiB. Search reads at most 16 MiB and returns at most 50 entries. `.gitignore` parsing is bounded to 256 KiB.
 
+## Agent tools
+
+Nio offers bounded tools with small results:
+
+- `find_files`: discover project files with path/glob filters and pagination. `path` defaults to `.` and stays within the active project; use `nio --dir /path/to/project` to work in another folder, or `:path` to inspect the current folder.
+- `search_code`: literal or regex search with numbered lines, short context, and pagination.
+- `web_fetch`: read an HTTP(S) page as text. HTML scripts/styles are removed; JavaScript execution, browser clicks, and forms are unsupported. Responses are capped at 1 MiB, excerpts at 8,000 characters, with `next_offset` for more.
+- `ask_user`: ask one clarification question with up to three choices, then end the turn and wait for your next message.
+- `terminal_start`, `terminal_read`, `terminal_cancel`: start an approved command, read incremental output, and stop it. Starting/stopping commands requires Build mode; sessions live within one Nio process and stop when it exits. At most four commands run concurrently, with a one-hour maximum timeout and a 64 KiB output tail.
+
+Ask and Plan allow research and project reads, while Build allows approved edits and commands. `--no-project-tools` allows web research, questions, and skill reading without project file or shell access. `--no-tools` disables every agent tool. `web_fetch` sends requests to the supplied website URL and returns page text to the model; no search service or search API key is required.
+
 ## Sessions and output
+
+Terminal responses render headings, bold (`**text**`), italics (`*text*`), lists, inline/fenced code, and streamed Markdown tables. JSON output preserves the original Markdown for host applications.
 
 Persist and resume conversations with `-s`:
 
@@ -210,13 +234,13 @@ Toggle automatic approval for a single run with `--auto`. Set reasoning effort w
 
 ## Privacy
 
-NioAI includes no telemetry, analytics, tracking, or background reporting. Network requests only go to features you use: model discovery, provider checks, and responses. Prompts, conversation context, project files, tool results, and approved command output can be sent to the model endpoint. Review your provider's terms before sending sensitive information. Credentials and sessions are stored locally; on Unix they are restricted to your user account. Avoid putting API keys directly in shell history.
+NioAI includes no telemetry, analytics, tracking, or background reporting. Network requests only go to features you use: model discovery, provider checks, responses, and requested web pages. Prompts, conversation context, project files, tool results, and approved command output can be sent to the model endpoint. Review your provider's terms before sending sensitive information. Credentials and sessions are stored locally; on Unix they are restricted to your user account. Avoid putting API keys directly in shell history.
 
 ## NioDE integration
 
 NioAI is available as the `nio` agent through NioDE's direct subprocess route. Install a current native `nio` executable on the server's `PATH`; Nio does not require npm or a persistent agent server. Automatic installation awaits published, verified native release artifacts.
 
-The Chat UI requests project access before enabling Nio tools. Build consent also grants file edits and shell execution for that conversation/project. Ask and Plan are enforced as read-only. Studio uses `--mode ask --no-tools`; it receives generated text and owns its file writes.
+The Chat UI requests project access before enabling Nio tools. Build consent also grants file edits and shell execution for that conversation/project. Ask and Plan are enforced as read-only. Studio and Canvas use `--mode ask --no-project-tools` with Nio 0.3.0 or later; it receives generated text and owns its file writes.
 
 For another host, the explicit interface is:
 
