@@ -1864,6 +1864,25 @@ fn highlight_code_line(line: &str) -> String {
     result
 }
 
+fn code_block_width(terminal_width: usize) -> usize {
+    terminal_width
+        .saturating_sub(RESPONSE_INDENT_WIDTH + 1)
+        .max(3)
+}
+
+fn render_code_line(line: &str, terminal_width: usize) -> String {
+    let content_width = code_block_width(terminal_width).saturating_sub(2).max(1);
+    let expanded = line.replace('\t', "    ");
+    let lines = wrap_saved_message(&expanded, content_width + 1);
+    if lines.is_empty() {
+        return "\x1b[38;5;244m│\x1b[0m \r\n".to_string();
+    }
+    lines
+        .iter()
+        .map(|line| format!("\x1b[38;5;244m│\x1b[0m {}\r\n", highlight_code_line(line)))
+        .collect()
+}
+
 fn markdown_table_cells(line: &str) -> Vec<String> {
     line.trim()
         .trim_matches('|')
@@ -2041,14 +2060,11 @@ impl MarkdownFormatter {
         }
         let mut output = self.drain(true);
         if !self.code_line_buffer.is_empty() {
-            output.push_str(&format!(
-                "\x1b[38;5;244m│\x1b[0m {}\r\n",
-                highlight_code_line(&self.code_line_buffer)
-            ));
+            output.push_str(&render_code_line(&self.code_line_buffer, self.wrap_width));
             self.code_line_buffer.clear();
         }
         if self.in_code_block {
-            let width = self.wrap_width.saturating_sub(RESPONSE_INDENT_WIDTH).max(1);
+            let width = code_block_width(self.wrap_width);
             output.push_str(&format!(
                 "\x1b[38;5;244m└{}\x1b[0m\r\n",
                 "─".repeat(width.saturating_sub(1))
@@ -2168,16 +2184,13 @@ impl MarkdownFormatter {
                     if full_line.trim_start().starts_with("```") {
                         self.in_code_block = false;
                         self.at_line_start = true;
-                        let width = self.wrap_width.saturating_sub(RESPONSE_INDENT_WIDTH).max(1);
+                        let width = code_block_width(self.wrap_width);
                         output.push_str(&format!(
                             "\x1b[38;5;244m└{}\x1b[0m\r\n",
                             "─".repeat(width.saturating_sub(1))
                         ));
                     } else {
-                        output.push_str(&format!(
-                            "\x1b[38;5;244m│\x1b[0m {}\r\n",
-                            highlight_code_line(&full_line)
-                        ));
+                        output.push_str(&render_code_line(&full_line, self.wrap_width));
                     }
                     continue;
                 } else if flush_partial {
@@ -2186,16 +2199,13 @@ impl MarkdownFormatter {
                     let full_line = std::mem::take(&mut self.code_line_buffer);
                     if full_line.trim_start().starts_with("```") {
                         self.in_code_block = false;
-                        let width = self.wrap_width.saturating_sub(RESPONSE_INDENT_WIDTH).max(1);
+                        let width = code_block_width(self.wrap_width);
                         output.push_str(&format!(
                             "\x1b[38;5;244m└{}\x1b[0m\r\n",
                             "─".repeat(width.saturating_sub(1))
                         ));
                     } else {
-                        output.push_str(&format!(
-                            "\x1b[38;5;244m│\x1b[0m {}\r\n",
-                            highlight_code_line(&full_line)
-                        ));
+                        output.push_str(&render_code_line(&full_line, self.wrap_width));
                     }
                     self.at_line_start = true;
                     break;
@@ -2210,8 +2220,9 @@ impl MarkdownFormatter {
                     let lang = header_line.trim_start_matches('`').trim().to_string();
                     let lang_tag = if lang.is_empty() { "code" } else { &lang };
                     self.in_code_block = true;
-                    let width = self.wrap_width.saturating_sub(RESPONSE_INDENT_WIDTH).max(1);
-                    let label = truncate(lang_tag, width.saturating_sub(5));
+                    let width = code_block_width(self.wrap_width);
+                    let label =
+                        strip_terminal_ansi(&clip_terminal_text(lang_tag, width.saturating_sub(5)));
                     let fill = width.saturating_sub(terminal_text_width(&label) + 5);
                     output.push_str(&format!(
                         "\r\n\x1b[38;5;244m┌─ \x1b[1;36m{label}\x1b[0;38;5;244m ─{}\x1b[0m\r\n",
@@ -10060,6 +10071,54 @@ mod markdown_tests {
         assert!(!started);
         assert_eq!(tools.len(), 1);
         assert_eq!(formatter.finish(), "");
+    }
+
+    #[test]
+    fn fenced_code_wraps_inside_the_frame_without_losing_text() {
+        let source =
+            "    ├── nio-server/    # chat/completions, 模型, sessions, health --config --tls";
+        for width in [24, 40, 80] {
+            let mut formatter = MarkdownFormatter::new(true);
+            formatter.wrap_width = width;
+            let mut output = formatter.push("```text\n");
+            output.push_str(&formatter.push(source));
+            output.push_str(&formatter.push("\n```\n"));
+            output.push_str(&formatter.finish());
+            let plain = strip_terminal_ansi(&output);
+            let mut restored = String::new();
+            for line in plain.lines().filter(|line| !line.is_empty()) {
+                assert!(
+                    terminal_text_width(line) + RESPONSE_INDENT_WIDTH < width,
+                    "overflow at {width}: {line}"
+                );
+                if let Some(content) = line.strip_prefix("│ ") {
+                    restored.push_str(content);
+                } else {
+                    assert!(line.starts_with(['┌', '└']));
+                }
+            }
+            assert_eq!(restored, source);
+        }
+    }
+
+    #[test]
+    fn unfinished_code_lines_and_tabs_stay_inside_the_frame() {
+        let mut formatter = MarkdownFormatter::new(true);
+        formatter.wrap_width = 30;
+        let mut output = formatter.push("```\n\tlong_code_line_that_needs_wrapping");
+        output.push_str(&formatter.finish());
+        let plain = strip_terminal_ansi(&output);
+        assert!(
+            plain
+                .lines()
+                .filter(|line| !line.is_empty())
+                .all(|line| terminal_text_width(line) + RESPONSE_INDENT_WIDTH < 30)
+        );
+        let restored: String = plain
+            .lines()
+            .filter_map(|line| line.strip_prefix("│ "))
+            .collect();
+        assert_eq!(restored, "    long_code_line_that_needs_wrapping");
     }
 
     #[test]

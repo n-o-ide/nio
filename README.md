@@ -6,9 +6,13 @@ NioAI is a lightweight, open source AI coding agent for the terminal. The execut
 
 An older, separate NIO platform also provides a `nio` command. If both are installed, use the full executable path or adjust `PATH`.
 
-Current release: [v0.3.1](https://github.com/nio-labs/nio/releases/tag/v0.3.1).
+Current release: [v0.3.2](https://github.com/nio-labs/nio/releases/tag/v0.3.2).
 
 Use `nio --version`, `nio -v`, or `nio --v` to print the installed version.
+
+## What’s new in v0.3.2
+
+- Wrap long fenced code lines inside their frame, accounting for response indentation and wide characters. Wrapped lines retain the frame prefix and complete code text.
 
 ## What’s new in v0.3.1
 
@@ -92,7 +96,7 @@ bash install.sh
 Custom installation options:
 ```sh
 # Pin a specific version
-curl -fsSL https://raw.githubusercontent.com/nio-labs/nio/main/install.sh | NIO_VERSION=v0.3.1 bash
+curl -fsSL https://raw.githubusercontent.com/nio-labs/nio/main/install.sh | NIO_VERSION=v0.3.2 bash
 
 # Custom install path (defaults to ~/.local/bin)
 curl -fsSL https://raw.githubusercontent.com/nio-labs/nio/main/install.sh | NIO_INSTALL_DIR="$HOME/.local/bin" bash
