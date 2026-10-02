@@ -10,28 +10,9 @@ Use `nio --version`, `nio -v`, or `nio --v` to print the installed version.
 
 ## Features
 
-```mermaid
-flowchart TD
-    Nio[NioAI coding agent]
-    Nio --> Work[Agent workflow]
-    Work --> Modes[Ask, Plan, and Build modes]
-    Work --> Tools[Project tools and shell commands]
-    Work --> Trust[Project trust and approval controls]
-    Nio --> Models[Models and providers]
-    Models --> Compatible[OpenAI-compatible endpoints]
-    Models --> Catalog[Model discovery and provider presets]
-    Nio --> Interfaces[Terminal interfaces]
-    Interfaces --> Inline[Inline CLI]
-    Interfaces --> TUI[Full-screen TUI]
-    Nio --> Sessions[Sessions and output]
-    Sessions --> Resume[Save and resume conversations]
-    Sessions --> JSON[JSON event stream]
-    Nio --> Extend[Extensions and integration]
-    Extend --> Skills[GitHub skills]
-    Extend --> Hosts[NioDE and other host integrations]
-```
-
-The diagram summarizes the main capabilities. See the sections below for commands, settings, and limits.
+| **Work in Ask, Plan, or Build mode**<br><br>Choose how much autonomy Nio should use, from read-only guidance to making changes. | **Use your preferred model**<br><br>Connect to configurable OpenAI-compatible providers, with model discovery and provider presets. | **Work directly in your project**<br><br>Search, read, and edit project files, or run approved shell commands from the terminal. |
+| --- | --- | --- |
+| **Keep work moving with a queue**<br><br>Queue follow-up requests while Nio is working. | **Pick your terminal interface**<br><br>Use the inline CLI or switch to the full-screen TUI. | **Resume and extend conversations**<br><br>Save sessions, stream JSON events, and add GitHub skills. |
 
 ## Requirements
 
