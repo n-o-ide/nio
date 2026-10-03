@@ -70,6 +70,12 @@ pub fn lock_file(path: &Path) -> Result<File, String> {
         .truncate(false)
         .open(path)
         .map_err(|e| e.to_string())?;
+    for _ in 0..20 {
+        if lock.try_lock().is_ok() {
+            return Ok(lock);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     lock.try_lock().map_err(|_| {
         format!(
             "{} is in use by another Nio process; retry after it finishes",
@@ -257,9 +263,19 @@ fn replace_project_file(
                 ));
             }
             let _lock = unsafe { File::from_raw_fd(lock_fd) };
-            _lock
-                .try_lock()
-                .map_err(|_| "project file is in use by another Nio process".to_string())?;
+            let mut locked = false;
+            for _ in 0..20 {
+                if _lock.try_lock().is_ok() {
+                    locked = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            if !locked {
+                _lock
+                    .try_lock()
+                    .map_err(|_| "project file is in use by another Nio process".to_string())?;
+            }
             let old = read_at(&dir, &target)?;
             if let Some(expected) = expected {
                 if old.as_deref() != expected {
