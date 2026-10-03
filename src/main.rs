@@ -5664,7 +5664,7 @@ fn configured_proxy_url() -> Result<Option<String>, String> {
             return Ok(Some(url));
         }
     }
-    Ok(load_user_config()?.proxy_url)
+    Ok(load_user_config().ok().and_then(|c| c.proxy_url))
 }
 
 fn build_http_client() -> Result<reqwest::Client, String> {
@@ -8336,8 +8336,10 @@ fn config_path() -> Result<PathBuf, String> {
     }
     let base = env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
+        .or_else(|| env::var_os("APPDATA").map(PathBuf::from))
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .ok_or("cannot locate config directory; set NIO_CONFIG or HOME")?;
+        .or_else(|| env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join(".config")))
+        .ok_or("cannot locate config directory; set NIO_CONFIG, APPDATA, or HOME")?;
     Ok(base.join("nio").join("config.json"))
 }
 
