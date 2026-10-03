@@ -1,5 +1,8 @@
+mod documents;
 mod extra_tools;
 mod inline_queue;
+mod plugin_process;
+mod plugins;
 mod reliability;
 mod skills;
 mod tui;
@@ -30,8 +33,13 @@ use tokio::io::AsyncReadExt;
 
 const KILO_BASE_URL: &str = "https://api.kilo.ai/api/gateway";
 const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
-const PROVIDER_PRESETS: [(&str, &str, &str); 13] = [
+const PROVIDER_PRESETS: [(&str, &str, &str); 14] = [
     ("openrouter", "OpenRouter", OPENROUTER_BASE_URL),
+    (
+        "vercel",
+        "Vercel AI Gateway",
+        "https://ai-gateway.vercel.sh/v1",
+    ),
     ("orca", "OrcaRouter", "https://api.orcarouter.ai/v1"),
     ("aihubmix", "AIHubMix", "https://aihubmix.com/v1"),
     ("groq", "Groq", "https://api.groq.com/openai/v1"),
@@ -601,6 +609,8 @@ struct ModelList {
 #[derive(Deserialize)]
 struct ModelInfo {
     id: String,
+    #[serde(default, rename = "type")]
+    model_type: Option<String>,
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
@@ -611,7 +621,9 @@ struct ModelInfo {
 
 #[derive(Deserialize)]
 struct ModelPricing {
+    #[serde(alias = "input")]
     prompt: Option<serde_json::Value>,
+    #[serde(alias = "output")]
     completion: Option<serde_json::Value>,
 }
 
@@ -869,6 +881,12 @@ async fn run() -> Result<(), CliError> {
                         skills::command(&base, &options.prompt, options.json_output, "nio --skills")
                     })
                     .map_err(CliError::from),
+                "plugins" => match skills_base() {
+                    Ok(base) => plugins_command(&base, &options.prompt, options.json_output)
+                        .await
+                        .map_err(CliError::from),
+                    Err(e) => Err(CliError::from(e)),
+                },
                 "config" => config_command(&options),
                 "doctor" => doctor_command(&options).await,
                 "completions" => completions_command(&options),
@@ -951,6 +969,7 @@ const SUBCOMMANDS: &[&str] = &[
     "provider",
     "sessions",
     "skills",
+    "plugins",
     "config",
     "doctor",
     "completions",
@@ -1061,9 +1080,14 @@ fn parse_args(args: Vec<String>) -> Result<Options, String> {
         Some("provider") => "provider".to_string(),
         Some("sessions") => "sessions".to_string(),
         Some("skills") => "skills".to_string(),
+        Some("plugins") => "plugins".to_string(),
         Some("config") => "config".to_string(),
         Some("doctor") => "doctor".to_string(),
         Some("completions") => "completions".to_string(),
+        Some("--plugins") => {
+            keep_first = true;
+            "plugins".to_string()
+        }
         Some("--skills") => {
             keep_first = true;
             "skills".to_string()
@@ -1124,6 +1148,17 @@ fn parse_args(args: Vec<String>) -> Result<Options, String> {
         match name {
             "--version" | "-V" | "--v" | "-v" => {
                 return Ok(default_options("version"));
+            }
+            "--plugins" => {
+                reject_flag_value(name, inline)?;
+                if !matches!(command.as_str(), "plugins" | "interactive" | "run") {
+                    return Err("--plugins is for plugin management".into());
+                }
+                command = "plugins".into();
+            }
+            "--languages" if command == "plugins" => {
+                prompt.push("--languages".into());
+                prompt.push(read_flag_value(&mut args, name, inline)?);
             }
             "--skills" => {
                 reject_flag_value(name, inline)?;
@@ -1221,6 +1256,7 @@ fn parse_args(args: Vec<String>) -> Result<Options, String> {
                         | "provider"
                         | "sessions"
                         | "skills"
+                        | "plugins"
                         | "config"
                         | "doctor"
                         | "completions"
@@ -1333,12 +1369,16 @@ async fn chat(options: &Options) -> Result<(), String> {
 
 fn agent_tools(mode: &str) -> Value {
     let tools = json!([
+        {"type":"function","function":{"name":"list_plugins","description":"List installed and available optional file-reader plugins, including PDF and its OCR language catalog. Does not install anything.","parameters":{"type":"object","properties":{},"additionalProperties":false}}},
+        {"type":"function","function":{"name":"install_plugin","description":"Install the optional PDF reader or OCR languages in Ask, Plan, or Build. name must be pdf. This tool itself requests user approval; call it directly when a user asks to read an attached PDF and the plugin is missing. Do not ask_user merely for installation approval or inspect project files to discover installation steps. Languages is none (default), comma-separated codes such as eng,khm, or all; for an apparently scanned document with no specified language, use eng as a suggested default in the approval. Repeat installation to add languages. Only use all if requested. Tesseract and Poppler are needed when OCR runs, not to install the plugin. Never install implicitly during reading.","parameters":{"type":"object","properties":{"name":{"type":"string"},"languages":{"type":"string"}},"required":["name"],"additionalProperties":false}}},
+        {"type":"function","function":{"name":"manage_plugin","description":"Enable, disable, or remove an installed plugin after user approval (Build only).","parameters":{"type":"object","properties":{"name":{"type":"string"},"action":{"type":"string","enum":["enable","disable","remove"]}},"required":["name","action"],"additionalProperties":false}}},
         {"type":"function","function":{"name":"read_skill_file","description":"Read SKILL.md or a supporting text file from an installed, enabled skill. Choose relevant skills from the system catalog before acting.","parameters":{"type":"object","properties":{"name":{"type":"string"},"path":{"type":"string","description":"Skill-relative path, default SKILL.md"}},"required":["name"],"additionalProperties":false}}},
-        {"type":"function","function":{"name":"read_file","description":"Read a UTF-8 text file or inspect a PNG, JPEG, GIF, or WebP image. Project-relative paths stay inside the project. When the user asks to read a specific absolute local path, read_file can access that file outside the project too. For long text files, read subsequent sections with start_line so you do not repeat the first section.","parameters":{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer","minimum":1,"description":"1-based first line to return; defaults to 1"},"line_count":{"type":"integer","minimum":1,"maximum":300,"description":"Maximum lines to return; defaults to 200"}},"required":["path"],"additionalProperties":false}}},
+        {"type":"function","function":{"name":"read_file","description":"Read UTF-8/UTF-16 text, PDF, Word DOCX/DOCM, Excel XLSX/XLS/XLSB/XLSM/XLAM, PowerPoint PPTX/PPTM, OpenDocument ODT/ODS/ODP, or inspect a PNG, JPEG, GIF, or WebP image. Documents return extracted text with line pagination; formatting and embedded images are not preserved. PDF requires the optional pdf plugin; scanned pages additionally require installed OCR languages, Tesseract, and Poppler. Use list_plugins to check availability. Project-relative paths stay inside the project. When the user asks to read a specific absolute local path, read_file can access that file outside the project too. For long text files, read subsequent sections with start_line so you do not repeat the first section.","parameters":{"type":"object","properties":{"path":{"type":"string"},"ocr_languages":{"type":"array","items":{"type":"string"},"maxItems":8,"description":"PDF OCR recognition languages, such as eng and khm; must be installed via the optional pdf plugin. Default uses English if installed, otherwise the first installed language."},"start_line":{"type":"integer","minimum":1,"description":"1-based first line to return; defaults to 1"},"line_count":{"type":"integer","minimum":1,"maximum":300,"description":"Maximum lines to return; defaults to 200"}},"required":["path"],"additionalProperties":false}}},
         {"type":"function","function":{"name":"find_files","description":"Find project files by path or glob. Returns up to 50 paths and next_offset for more.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Project-relative path, default .; searches cannot leave the active project."},"glob":{"type":"string","description":"Glob such as *.rs or src/**/*.rs"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":50}},"additionalProperties":false}}},
         {"type":"function","function":{"name":"search_code","description":"Search project text with literal text or regex. Returns bounded line excerpts and next_offset.","parameters":{"type":"object","properties":{"query":{"type":"string"},"path":{"type":"string","description":"Project-relative path, default .; searches cannot leave the active project."},"glob":{"type":"string"},"regex":{"type":"boolean"},"case_sensitive":{"type":"boolean"},"context_lines":{"type":"integer","minimum":0,"maximum":2},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":50}},"required":["query"],"additionalProperties":false}}},
         {"type":"function","function":{"name":"web_fetch","description":"Read a webpage as short text. Use offset to read the next section. Cite the returned URL when answering.","parameters":{"type":"object","properties":{"url":{"type":"string"},"offset":{"type":"integer","minimum":0},"max_chars":{"type":"integer","minimum":1,"maximum":8000}},"required":["url"],"additionalProperties":false}}},
-        {"type":"function","function":{"name":"ask_user","description":"Ask one focused question when a missing answer blocks work. Ends this turn so the user can reply.","parameters":{"type":"object","properties":{"question":{"type":"string"},"options":{"type":"array","items":{"type":"string"},"maxItems":3}},"required":["question"],"additionalProperties":false}}},
+        {"type":"function","function":{"name":"ask_user","description":"Ask one focused question when a missing answer blocks work. In an interactive terminal, collect the answer immediately and continue; otherwise end the turn for a reply.","parameters":{"type":"object","properties":{"question":{"type":"string"},"options":{"type":"array","items":{"type":"string"},"maxItems":3}},"required":["question"],"additionalProperties":false}}},
+        {"type":"function","function":{"name":"request_build_mode","description":"Ask the user to switch from Ask or Plan to Build so you can implement their request. Ends the turn with Yes/No options. Only a subsequent explicit Yes switches modes; file and command approval settings still apply.","parameters":{"type":"object","properties":{},"additionalProperties":false}}},
         {"type":"function","function":{"name":"terminal_start","description":"Start an approved command in the project and return a session ID. Build mode only. Read output with terminal_read and stop with terminal_cancel.","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout_seconds":{"type":"integer","minimum":1,"maximum":3600}},"required":["command"],"additionalProperties":false}}},
         {"type":"function","function":{"name":"terminal_read","description":"Read new output from a terminal session. Returns running, exit_code, and next_cursor.","parameters":{"type":"object","properties":{"session_id":{"type":"string"},"cursor":{"type":"integer","minimum":0},"wait_ms":{"type":"integer","minimum":0,"maximum":1000}},"required":["session_id"],"additionalProperties":false}}},
         {"type":"function","function":{"name":"terminal_cancel","description":"Stop an approved terminal session. Build mode only.","parameters":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}}},
@@ -1360,7 +1400,9 @@ fn agent_tools(mode: &str) -> Value {
                         && tool["function"]["name"] != "patch_file"
                         && tool["function"]["name"] != "run_command"
                         && tool["function"]["name"] != "terminal_start"
+                        && tool["function"]["name"] != "terminal_read"
                         && tool["function"]["name"] != "terminal_cancel"
+                        && tool["function"]["name"] != "manage_plugin"
             })
             .cloned()
             .collect(),
@@ -1371,8 +1413,85 @@ fn mode_allows_changes(mode: &str) -> bool {
     mode == "build"
 }
 
+fn normalize_tool_name(name: &str) -> String {
+    // Some providers leak their tool-call closing delimiter into the name.
+    // Repair only known closing suffixes on a registered tool, before mode checks.
+    let trimmed = name.trim();
+    let candidate = trimmed
+        .strip_suffix("</function>")
+        .or_else(|| trimmed.strip_suffix("</function"))
+        .map(str::trim);
+    if let Some(candidate) = candidate
+        && agent_tools("build")
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["function"]["name"].as_str() == Some(candidate))
+    {
+        return candidate.to_string();
+    }
+    name.to_string()
+}
+
+fn unknown_tool_error(name: &str, tools: &Value) -> String {
+    let names = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|tool| tool["function"]["name"].as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Unknown tool {name:?}. Use an exact function name from the available tools: {names}. Call the function directly; do not use edit, call_tool, or tool_name wrappers, or XML tags."
+    )
+}
+
 fn public_tool(name: &str) -> bool {
-    matches!(name, "read_skill_file" | "web_fetch" | "ask_user")
+    matches!(
+        name,
+        "read_skill_file"
+            | "list_plugins"
+            | "install_plugin"
+            | "web_fetch"
+            | "ask_user"
+            | "request_build_mode"
+    )
+}
+
+fn confirms_build_mode(history: &[Value], prompt: &str) -> bool {
+    if !matches!(
+        prompt.trim().to_ascii_lowercase().as_str(),
+        "yes" | "y" | "1" | "yes, switch to build" | "switch to build"
+    ) {
+        return false;
+    }
+    // Only the immediately pending, application-generated question authorizes
+    // a switch. Ordinary questions and old confirmations must never do so.
+    let start = history
+        .iter()
+        .rposition(|m| m["role"] == "user")
+        .map_or(0, |i| i + 1);
+    let tail = &history[start..];
+    tail.iter().any(|m| {
+        if m["role"] != "tool" {
+            return false;
+        }
+        let Some(content) = m["content"].as_str() else {
+            return false;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(content) else {
+            return false;
+        };
+        value["requested_mode"] == "build"
+            && tail.iter().any(|a| {
+                a["tool_calls"].as_array().is_some_and(|calls| {
+                    calls.iter().any(|c| {
+                        c["id"] == m["tool_call_id"]
+                            && c["function"]["name"] == "request_build_mode"
+                    })
+                })
+            })
+    })
 }
 
 fn tools_for_turn(options: &Options, mode: &str) -> Value {
@@ -1402,6 +1521,116 @@ mod mode_tests {
     static TEST_ID: AtomicUsize = AtomicUsize::new(0);
 
     #[test]
+    fn provider_filters_combine_with_search_and_keep_catalog_indices() {
+        let model = |id: &str, gateway: &str, label: &str, free| super::ModelChoice {
+            id: id.into(),
+            name: id.into(),
+            gateway: gateway.into(),
+            gateway_label: label.into(),
+            free,
+        };
+        let choices = vec![
+            model("shared/chat", "kilo", "Kilo Gateway", true),
+            model("shared/chat", "vercel", "Vercel AI Gateway", true),
+            model("other/chat", "vercel", "Vercel AI Gateway", false),
+        ];
+        assert_eq!(
+            super::filtered_model_indices(&choices, "", Some("vercel")),
+            vec![1, 2]
+        );
+        assert_eq!(
+            super::filtered_model_indices(&choices, "shared free", Some("vercel")),
+            vec![1]
+        );
+        assert_eq!(
+            super::filtered_model_indices(&choices, "shared", None),
+            vec![0, 1]
+        );
+        assert!(super::filtered_model_indices(&choices, "other", Some("kilo")).is_empty());
+        assert_eq!(
+            super::model_provider_filters(&choices),
+            vec![
+                (None, "All providers".into()),
+                (Some("kilo".into()), "Kilo Gateway".into()),
+                (Some("vercel".into()), "Vercel AI Gateway".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn vercel_catalog_excludes_non_language_models_and_reads_free_pricing() {
+        let catalog: super::ModelList = serde_json::from_value(serde_json::json!({"data":[
+            {"id":"convaiinnovations/laya-free","type":"evaluation","pricing":{"input":"0","output":"0"}},
+            {"id":"test/embed","type":"embedding"},
+            {"id":"test/image","type":"image"},
+            {"id":"test/free-chat","type":"language","pricing":{"input":"0","output":"0"}},
+            {"id":"test/paid-chat","type":"language","pricing":{"input":"0.01","output":"0.02"}},
+            {"id":"test/legacy-chat"}
+        ]})).unwrap();
+        let choices = super::choices_from_catalog(catalog.data, "vercel", "Vercel AI Gateway");
+        assert_eq!(
+            choices.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["test/free-chat", "test/paid-chat", "test/legacy-chat"]
+        );
+        assert!(choices[0].free);
+        assert!(!choices[1].free);
+    }
+
+    #[test]
+    fn build_confirmation_only_accepts_the_pending_mode_question() {
+        let mut history = vec![
+            serde_json::json!({"role":"user","content":"Implement this"}),
+            serde_json::json!({"role":"assistant","tool_calls":[{"id":"switch","function":{"name":"request_build_mode"}}]}),
+            serde_json::json!({"role":"tool","tool_call_id":"switch","content":"{\"requested_mode\":\"build\"}"}),
+            serde_json::json!({"role":"assistant","content":"Switch to Build?"}),
+        ];
+        assert!(super::confirms_build_mode(&history, "YES"));
+        assert!(!super::confirms_build_mode(&history, "no"));
+        assert!(!super::confirms_build_mode(
+            &history,
+            "yes, but stay in Ask"
+        ));
+        let mut ordinary = history.clone();
+        ordinary[1]["tool_calls"][0]["function"]["name"] = serde_json::json!("ask_user");
+        assert!(!super::confirms_build_mode(&ordinary, "yes"));
+        history.push(serde_json::json!({"role":"user","content":"No"}));
+        history.push(serde_json::json!({"role":"assistant","content":"Anything else?"}));
+        assert!(!super::confirms_build_mode(&history, "yes"));
+    }
+
+    #[test]
+    fn provider_tool_delimiters_only_repair_registered_names() {
+        for name in [
+            "git_diff",
+            "git_status",
+            "write_file",
+            "read_file",
+            "terminal_read",
+        ] {
+            for suffix in ["</function>", "</function"] {
+                assert_eq!(
+                    super::normalize_tool_name(&format!("{name}\n{suffix}")),
+                    name
+                );
+            }
+            assert_eq!(super::normalize_tool_name(name), name);
+        }
+        for name in [
+            "edit",
+            "call_tool",
+            "tool_name",
+            "edit\n</function>",
+            "write_file</function>extra",
+            "call_tool.write_file",
+        ] {
+            assert_eq!(super::normalize_tool_name(name), name);
+        }
+        let error = super::unknown_tool_error("edit\n</function>", &agent_tools("ask"));
+        assert!(error.contains("read_file") && error.contains("git_diff"));
+        assert!(!error.contains("write_file") && !error.contains('\n'));
+    }
+
+    #[test]
     fn ask_and_plan_modes_never_advertise_mutating_tools() {
         for mode in ["ask", "plan"] {
             let tools = agent_tools(mode);
@@ -1413,10 +1642,19 @@ mod mode_tests {
                             | "patch_file"
                             | "run_command"
                             | "terminal_start"
+                            | "terminal_read"
                             | "terminal_cancel"
+                            | "manage_plugin"
                     )
                 )
             }));
+            assert!(
+                tools
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool["function"]["name"] == "install_plugin")
+            );
             assert!(!mode_allows_changes(mode));
         }
     }
@@ -1433,7 +1671,11 @@ mod mode_tests {
             .iter()
             .map(|tool| tool["function"]["name"].as_str().unwrap())
             .collect();
-        assert!(names.contains(&"web_fetch") && names.contains(&"ask_user"));
+        assert!(
+            names.contains(&"web_fetch")
+                && names.contains(&"ask_user")
+                && names.contains(&"install_plugin")
+        );
         assert!(!names.contains(&"read_file") && !names.contains(&"terminal_start"));
         options.no_tools = true;
         assert!(
@@ -2790,8 +3032,16 @@ fn process_sse_line(
             }
             call.name.push_str(&partial.function.name);
             call.arguments.push_str(&partial.function.arguments);
-            if call.arguments.len() > EVENT_LIMIT || call.name.len() > 100 || call.id.len() > 200 {
-                return Err("tool call exceeded size limits".into());
+            for (field, size, limit) in [
+                ("arguments", call.arguments.len(), EVENT_LIMIT),
+                ("name", call.name.len(), 100),
+                ("ID", call.id.len(), 200),
+            ] {
+                if size > limit {
+                    return Err(format!(
+                        "provider tool-call {field} exceeded the {limit}-byte limit ({size} bytes received); tools were not executed. Try another model if this repeats."
+                    ));
+                }
             }
         }
     }
@@ -2998,7 +3248,7 @@ fn tool_hint(name: &str, args: &Value) -> String {
             .and_then(Value::as_str)
             .unwrap_or(""),
         "web_fetch" => args.get("url").and_then(Value::as_str).unwrap_or(""),
-        "ask_user" => args.get("question").and_then(Value::as_str).unwrap_or(""),
+        "ask_user" => "",
         "terminal_read" | "terminal_cancel" => {
             args.get("session_id").and_then(Value::as_str).unwrap_or("")
         }
@@ -3007,6 +3257,40 @@ fn tool_hint(name: &str, args: &Value) -> String {
         _ => "",
     }
     .to_string()
+}
+
+fn interactive_question(args: &Value) -> Result<Option<String>, String> {
+    let question = args["question"].as_str().unwrap_or("").trim();
+    let choices = args["options"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .take(3)
+        .map(str::trim)
+        .filter(|choice| !choice.is_empty())
+        .collect::<Vec<_>>();
+    if choices.is_empty() {
+        let answer = read_console_line(&format!("\n{question}\nAnswer: "))?;
+        return Ok((!answer.trim().is_empty()).then(|| answer.trim().to_string()));
+    }
+    println!("\n{question}");
+    let mut items = choices
+        .iter()
+        .map(|choice| (*choice, "", false))
+        .collect::<Vec<_>>();
+    items.push(("Type your own answer", "", false));
+    let Some(selected) = select_menu_option_b("Choose an answer", &items, 0)? else {
+        return Ok(None);
+    };
+    if selected == choices.len() {
+        let answer = read_console_line("Answer: ")?;
+        Ok((!answer.trim().is_empty()).then(|| answer.trim().to_string()))
+    } else {
+        let answer = choices[selected].to_string();
+        println!("You: {answer}");
+        Ok(Some(answer))
+    }
 }
 
 static LAST_EDIT_DETAILS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
@@ -3206,18 +3490,65 @@ fn show_latest_edit_details(history: &[Value]) -> Result<(), String> {
     Ok(())
 }
 
+async fn readable_text(
+    path: &Path,
+    languages: &[String],
+    cancelled: Option<Arc<AtomicBool>>,
+) -> Result<String, String> {
+    if let Some(text) = plugins::extract(&skills_base()?, path, languages, cancelled).await? {
+        return Ok(text);
+    }
+    documents::read_text(path)
+}
+
 async fn execute_agent_tool(
     root: &Path,
     call: &AssistantToolCall,
     auto_approve: bool,
+    mode: &str,
     interrupt: &mut EscapeInterrupt,
 ) -> Result<String, String> {
     let args = &call.arguments;
     match call.name.as_str() {
+        "list_plugins" => Ok(plugins::information(&skills_base()?)?.to_string()),
+        "install_plugin" => {
+            let name = required_arg(args, "name")?;
+            if name != "pdf" {
+                return Err("available plugin: pdf".into());
+            }
+            let selection = args.get("languages").and_then(Value::as_str);
+            let chosen = plugins::selected_languages(selection)?;
+            let models = plugins::languages();
+            let bytes = models.iter().filter(|l| chosen.contains(&l.code)).map(|l| l.size).sum::<usize>();
+            let language_label = if chosen.is_empty() { "none".into() } else if selection == Some("all") { format!("all {}", chosen.len()) } else { chosen.join(",") };
+            let action = format!("Install PDF · OCR {language_label} · {:.1} MiB", bytes as f64 / 1048576.0);
+            let summary = format!("Optional PDF reader · OCR {language_label} · {:.1} MiB download", bytes as f64 / 1048576.0);
+            let details = format!("Nio needs the optional PDF reader to read PDFs. Install it now? OCR languages: {language_label}; estimated download: {:.1} MiB. The plugin runs locally with your account's access.", bytes as f64 / 1048576.0);
+            if !interrupt.with_terminal_input(|| confirm_tool(auto_approve && mode_allows_changes(mode), &action, Some((&summary, &details))))? { return Err("user denied plugin installation".into()); }
+            let base = skills_base()?;
+            let cancellation = async {
+                while !interrupt.cancelled.load(Ordering::SeqCst) { tokio::time::sleep(Duration::from_millis(50)).await; }
+            };
+            tokio::select! {
+                result = plugins::install(&base, name, selection) => result,
+                _ = cancellation => Err(TURN_INTERRUPTED.into()),
+            }
+        }
+        "manage_plugin" => {
+            let name = required_arg(args, "name")?;
+            let action = required_arg(args, "action")?;
+            if !interrupt.with_terminal_input(|| confirm_tool(auto_approve, &format!("Plugin {name}: {action}"), None))? { return Err("user denied plugin change".into()); }
+            plugins::manage(&skills_base()?, action, name)
+        }
         "find_files" => extra_tools::find_files(root, args),
         "search_code" => extra_tools::search_code(root, args, &interrupt.cancelled),
         "web_fetch" => extra_tools::web_fetch(args).await,
         "ask_user" => extra_tools::ask_user(args),
+        "request_build_mode" => Ok(json!({
+            "question":"Switch to Build mode so I can make the requested changes?\n1. Yes, switch to Build\n2. No, keep the current mode",
+            "needs_user_input":true,
+            "requested_mode":"build"
+        }).to_string()),
         "terminal_start" => {
             let command = required_arg(args, "command")?;
             if !interrupt.with_terminal_input(|| {
@@ -3273,11 +3604,8 @@ async fn execute_agent_tool(
                 let name = path.file_name().unwrap_or_default().to_string_lossy();
                 return Ok(format!("\0NIO_IMAGE\n{mime}\n{name}\n{encoded}"));
             }
-            if metadata.len() > 512 * 1024 {
-                return Err("file is larger than the 512 KiB read limit".into());
-            }
-            let contents = String::from_utf8(read_bounded(&path, FILE_LIMIT)?)
-                .map_err(|e| format!("file is not readable UTF-8 text: {e}"))?;
+            let recognition = args.get("ocr_languages").and_then(Value::as_array).map(|values| values.iter().map(|v| v.as_str().map(str::to_string).ok_or("ocr_languages must be strings")).collect::<Result<Vec<_>, _>>()).transpose()?.unwrap_or_default();
+            let contents = readable_text(&path, &recognition, Some(interrupt.cancelled.clone())).await?;
             let lines = contents.lines().collect::<Vec<_>>();
             if lines.is_empty() {
                 return Ok(format!("File '{input}' is empty."));
@@ -3304,6 +3632,13 @@ async fn execute_agent_tool(
             for (index, line) in lines.iter().enumerate().skip(start).take(requested_count) {
                 let row = format!("{line}\n");
                 if excerpt.len() + row.len() > 9_000 {
+                    if excerpt.is_empty() {
+                        let mut cut = 8_800.min(row.len());
+                        while !row.is_char_boundary(cut) { cut -= 1; }
+                        excerpt.push_str(&row[..cut]);
+                        excerpt.push_str("\n[Long line truncated to fit tool output.]\n");
+                        end = index + 1;
+                    }
                     break;
                 }
                 excerpt.push_str(&row);
@@ -3463,13 +3798,7 @@ async fn execute_agent_tool(
             if checked != path {
                 return Err("file path changed during approval".into());
             }
-            record_backup(path.clone(), Some(original_bytes.clone()));
-            atomic_write_project(
-                root,
-                &path,
-                patched_text.as_bytes(),
-                Some(Some(&original_bytes)),
-            )?;
+            write_with_backup(root, &path, patched_text.as_bytes(), Some(&original_bytes))?;
             Ok(edit_report(&display_path, &original_bytes, &patched_text))
         }
         "write_file" => {
@@ -3512,8 +3841,7 @@ async fn execute_agent_tool(
             if checked != path {
                 return Err("file path changed during approval".into());
             }
-            record_backup(path.clone(), original.clone());
-            atomic_write_project(root, &path, content.as_bytes(), Some(original.as_deref()))?;
+            write_with_backup(root, &path, content.as_bytes(), original.as_deref())?;
             if original.is_none() && content.is_empty() {
                 Ok(format!("Created empty file {display_path}."))
             } else {
@@ -3753,7 +4081,7 @@ fn confirm_tool(
         .unwrap_or(80);
     let action = truncate(action, width.saturating_sub(64).max(8));
     let mut selected_yes = false;
-    let mut details_visible = false;
+    let mut details_visible = preview.is_some();
     let mut rendered_rows = 0usize;
     let draw = |selected_yes: bool,
                 details_visible: bool,
@@ -3776,9 +4104,10 @@ fn confirm_tool(
             eprint!("\r\n");
             rows += 1;
             if details_visible {
-                let details_crlf = details.replace('\n', "\r\n");
-                eprint!("{details_crlf}");
-                rows += details.lines().count();
+                for line in wrap_saved_message(details, width.saturating_sub(2).max(10)) {
+                    eprint!("{line}\r\n");
+                    rows += 1;
+                }
             }
         }
         let yes = if selected_yes {
@@ -4145,7 +4474,17 @@ async fn run_agent_turn_inner(
             root.display()
         ));
     }
-    let user_config = load_user_config()?;
+    let mut user_config = load_user_config()?;
+    let switch_confirmed = !options.no_tools && confirms_build_mode(history, prompt);
+    if switch_confirmed {
+        user_config.agent_mode = Some("build".into());
+        save_user_config(&user_config)?;
+        emit_status(
+            options,
+            "working",
+            "Switched to Build mode; action approval settings still apply",
+        );
+    }
     let progress_style = configured_progress_style(&user_config);
     let turn_start = Instant::now();
     let mut explored_count = 0usize;
@@ -4165,18 +4504,22 @@ async fn run_agent_turn_inner(
             let _ = io::stderr().flush();
         }
     }
-    let mode = options
-        .mode
-        .as_deref()
-        .unwrap_or_else(|| configured_agent_mode(&user_config));
+    let mode = if switch_confirmed {
+        "build"
+    } else {
+        options
+            .mode
+            .as_deref()
+            .unwrap_or_else(|| configured_agent_mode(&user_config))
+    };
     let auto_approve_actions = options.auto_approve
         || (options.command == "interactive" && user_config.auto_approve_actions.unwrap_or(false));
     let mode_instructions = match mode {
         "ask" => {
-            "Mode: Ask. Answer questions and clarify requests. You may inspect project files for context, but never make changes or run commands."
+            "Mode: Ask. Answer questions and clarify requests. When a user supplies a PDF and its plugin is missing, call install_plugin directly; its approval prompt asks permission even when automatic approval is enabled. After approval, read the PDF and answer the user's request in this same turn. Do not read project documentation or check OCR command dependencies before offering plugin installation; those dependencies matter only when OCR runs. You may inspect project files for context, but never make changes or run commands. Terminal tools are unavailable. If the user requests project edits or command execution, call request_build_mode to offer a Yes/No switch to Build, then wait for their answer."
         }
         "plan" => {
-            "Mode: Plan. Inspect the project as needed and return a clear implementation plan. Do not change files or run commands."
+            "Mode: Plan. Inspect the project as needed and return a clear implementation plan. When a user supplies a PDF and its plugin is missing, call install_plugin directly; its approval prompt asks permission even when automatic approval is enabled. After approval, read the PDF in this same turn. Do not read project documentation or check OCR command dependencies before offering plugin installation. Do not change project files or run commands. Terminal tools are unavailable. If the user requests implementation, call request_build_mode to offer a Yes/No switch to Build, then wait for their answer."
         }
         _ => {
             "Mode: Build. Carry out the user's requested work. Inspect first, then make changes and run commands when appropriate. Ask before writing files or executing shell commands unless auto-approval was explicitly enabled."
@@ -4199,9 +4542,15 @@ async fn run_agent_turn_inner(
     } else {
         String::new()
     };
-    let skill_catalog = skills::catalog(&skills_base()?)?;
-    let mut messages =
-        vec![json!({"role":"system", "content": format!("{system}{overview}{skill_catalog}")})];
+    let skill_catalog = format!(
+        "{}{}",
+        skills::catalog(&skills_base()?)?,
+        plugins::catalog(&skills_base()?)?
+    );
+    let tool_instructions = "\n\nWhen calling tools, use only the exact function names supplied in the tools schema and provide their required JSON arguments. Do not append XML tags to function names or use generic tool wrappers. After a tool error, use its feedback to correct the call rather than repeat it. Use web_fetch to read source URLs. When you lack a reliable source URL, ask the user for a URL or explain the limitation; do not invent repository URLs or claim failed fetches provide evidence.";
+    let mut messages = vec![
+        json!({"role":"system", "content": format!("{system}{overview}{skill_catalog}{tool_instructions}")}),
+    ];
     // Keep as much prior work as the request budget allows. The old half-budget
     // trim silently discarded useful context before the model ever saw it.
     trim_history(history, CONTEXT_LIMIT);
@@ -4217,36 +4566,62 @@ async fn run_agent_turn_inner(
     if prompt.len() > 24 * 1024 {
         return Err("prompt exceeds the 24 KiB limit".into());
     }
-    for path in options.attachments.iter().chain(&referenced_attachments) {
-        if path
-            .extension()
+    let attachment_paths = options
+        .attachments
+        .iter()
+        .chain(&referenced_attachments)
+        .collect::<Vec<_>>();
+    let has_pdf_attachment = attachment_paths.iter().any(|path| {
+        path.extension()
             .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
-        {
-            return Err(format!(
-                "PDF attachment '{}' is not supported yet; export its text or attach page images",
-                path.display()
-            ));
-        }
-        let image_mime = supported_image_mime(path);
-        let max_size = if image_mime.is_some() {
-            IMAGE_ATTACHMENT_LIMIT
-        } else {
-            24 * 1024
+    });
+    let mut pdf_install_error = None::<String>;
+    let mut pdf_installed_during_preflight = false;
+    if has_pdf_attachment
+        && !options.no_tools
+        && (io::stdin().is_terminal() || tui::active())
+        && !plugins::list(&skills_base()?)?
+            .iter()
+            .any(|plugin| plugin.enabled && plugin.manifest.extensions.iter().any(|e| e == "pdf"))
+    {
+        let likely_scanned = attachment_paths.iter().any(|path| {
+            path.extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
+                && path.file_name().is_some_and(|name| {
+                    name.to_string_lossy().to_ascii_lowercase().contains("scan")
+                })
+        });
+        let call = AssistantToolCall {
+            id: "pdf-attachment-install".into(),
+            name: "install_plugin".into(),
+            arguments: json!({"name":"pdf", "languages":if likely_scanned { "eng" } else { "none" }}),
         };
-        let data = read_bounded(path, max_size).map_err(|error| {
-            if image_mime.is_some()
-                && path
-                    .metadata()
-                    .is_ok_and(|metadata| metadata.len() as usize > IMAGE_ATTACHMENT_LIMIT)
-            {
-                format!(
-                    "image attachment '{}' exceeds the 10 MiB per-image limit",
-                    path.display()
-                )
-            } else {
-                error
+        emit_status(
+            options,
+            "working",
+            "PDF reader installation requires approval",
+        );
+        match execute_agent_tool(&root, &call, auto_approve_actions, mode, interrupt).await {
+            Ok(_) => {
+                pdf_installed_during_preflight = true;
+                emit_status(options, "working", "PDF reader installed");
             }
-        })?;
+            Err(error) if error == TURN_INTERRUPTED => return Err(error),
+            Err(error) => pdf_install_error = Some(error),
+        }
+    }
+    if pdf_installed_during_preflight && let Some(content) = messages[0]["content"].as_str() {
+        messages[0]["content"] = json!(format!(
+            "{content}\nThe PDF reader was installed for this attachment during this turn; use the attached text or read_file and do not reinstall it."
+        ));
+    }
+    for (attachment_index, path) in attachment_paths.iter().enumerate() {
+        let image_mime = supported_image_mime(path);
+        let data = if image_mime.is_some() {
+            read_bounded(path, IMAGE_ATTACHMENT_LIMIT)?
+        } else {
+            Vec::new()
+        };
         if let Some(mime) = image_mime {
             validate_image_signature(path, &data)?;
             image_bytes_total = image_bytes_total.saturating_add(data.len());
@@ -4267,31 +4642,74 @@ async fn run_agent_turn_inner(
             ));
             continue;
         }
-        let content = match String::from_utf8(data) {
-            Ok(content) if !content.contains('\0') => content,
-            _ if path
-                .extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf")) =>
-            {
-                return Err(format!(
-                    "PDF attachment '{}' is not supported yet; export its text or attach page images",
-                    path.display()
-                ));
+        let absolute = path.canonicalize().map_err(|e| e.to_string())?;
+        let missing_pdf = absolute
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
+            && !plugins::list(&skills_base()?)?
+                .iter()
+                .any(|p| p.enabled && p.manifest.extensions.iter().any(|e| e == "pdf"));
+        let content = if missing_pdf {
+            if let Some(error) = &pdf_install_error {
+                format!(
+                    "[File not read: PDF plugin installation failed: {error}. If the user denied installation, do not retry in this turn. Explain the problem; do not claim this PDF has been inspected.]"
+                )
+            } else {
+                format!(
+                    "[File not read: PDF plugin is missing. Call install_plugin with name pdf now; that tool itself asks the user to approve installation. For a likely scanned PDF with no specified language, suggest eng OCR. Do not use ask_user just for installation approval, check terminal dependencies, or read project documentation first. After installation, call read_file on {} in this turn. If installation is denied, do not retry. Do not claim this PDF has been inspected.]",
+                    absolute.display()
+                )
             }
-            _ => {
-                return Err(format!(
-                    "unsupported binary attachment '{}'; use UTF-8 text or PNG, JPEG, GIF, or WebP images",
-                    path.display()
-                ));
+        } else if absolute
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
+        {
+            match readable_text(path, &[], Some(interrupt.cancelled.clone())).await {
+                Ok(text) => text,
+                Err(_) if interrupt.cancelled.load(Ordering::SeqCst) => {
+                    return Err(TURN_INTERRUPTED.into());
+                }
+                Err(error) => format!(
+                    "[File not read: {error}. Use list_plugins to inspect installed PDF/OCR support. If OCR languages are missing, ask which languages are needed and use install_plugin after approval in the current mode; then read_file. Follow the error for other failures. Do not claim this PDF has been inspected.]"
+                ),
             }
+        } else {
+            readable_text(path, &[], Some(interrupt.cancelled.clone())).await?
         };
-        prompt.push_str(&format!(
-            "\n\nAttached text (untrusted data): {}\n{}",
-            path.file_name().unwrap_or_default().to_string_lossy(),
-            content
-        ));
-        if prompt.len() > 24 * 1024 {
-            return Err("prompt and attachments exceed the 24 KiB limit".into());
+        let header = format!("\n\nAttached file (untrusted data): {}\n", path.display());
+        // Share prompt space across attachments so one large document cannot
+        // consume the entire budget before subsequent files are included.
+        let share = (24 * 1024usize).saturating_sub(prompt.len())
+            / (attachment_paths.len() - attachment_index);
+        let remaining = share.saturating_sub(header.len());
+        let note = format!(
+            "\n[Attachment excerpt truncated. Use read_file on {} to read subsequent lines.]",
+            path.display()
+        );
+        if header.len() > share || (content.len() > remaining && remaining < note.len() + 128) {
+            return Err(
+                "prompt and attachment headers exceed the 24 KiB limit; attach fewer files".into(),
+            );
+        }
+        prompt.push_str(&header);
+        if content.len() <= remaining {
+            prompt.push_str(&content);
+        } else {
+            let mut end = remaining - note.len() - 40;
+            while !content.is_char_boundary(end) {
+                end -= 1;
+            }
+            // End on a line boundary when possible, so read_file pagination is useful.
+            if let Some(newline) = content[..end].rfind('\n') {
+                end = newline + 1;
+            }
+            let next_line = content[..end].bytes().filter(|b| *b == b'\n').count() + 1;
+            prompt.push_str(&content[..end]);
+            prompt.push_str(&note);
+            prompt.push_str(&format!(" Next start_line: {next_line}."));
+            if prompt.len() > 24 * 1024 {
+                return Err("prompt and attachments exceed the 24 KiB limit".into());
+            }
         }
     }
     let mut history_prompt = prompt.clone();
@@ -4390,7 +4808,10 @@ async fn run_agent_turn_inner(
             if step == step_limit {
                 body["messages"].as_array_mut().unwrap().push(json!({"role":"user", "content":"The tool-step budget for this turn has been reached. Stop using tools and summarize changes actually made, any errors, and remaining work. Do not claim unfinished work is complete. Tell the user they can continue this task in the same session."}));
             }
-            if step == step_limit || tools.as_array().is_some_and(Vec::is_empty) {
+            if step == step_limit
+                || retried_empty_response
+                || tools.as_array().is_some_and(Vec::is_empty)
+            {
                 body.as_object_mut().unwrap().remove("tools");
                 body.as_object_mut().unwrap().remove("tool_choice");
             }
@@ -4553,7 +4974,7 @@ async fn run_agent_turn_inner(
                 }
                 Ok(AssistantToolCall {
                     id: pending.id,
-                    name: pending.name,
+                    name: normalize_tool_name(&pending.name),
                     arguments,
                 })
             })
@@ -4580,6 +5001,7 @@ async fn run_agent_turn_inner(
                     retried_empty_response = true;
                     compact_tool_messages(&mut messages);
                     compact_tool_messages(history);
+                    messages.push(json!({"role":"system","content":"Your last response completed without answer text or a tool call. Give a concise user-facing answer now using the conversation and available tool results. If information is missing, say what is missing. Do not make further tool calls for this response."}));
                     emit_status(
                         options,
                         "retrying",
@@ -4640,7 +5062,13 @@ async fn run_agent_turn_inner(
             let tool_label = format!("{} {}", call.name, tool_hint_str);
             let is_mutating = matches!(
                 call.name.as_str(),
-                "write_file" | "patch_file" | "run_command" | "terminal_start" | "terminal_cancel"
+                "write_file"
+                    | "patch_file"
+                    | "run_command"
+                    | "terminal_start"
+                    | "terminal_cancel"
+                    | "install_plugin"
+                    | "manage_plugin"
             );
             let status = if is_mutating { "working" } else { "exploring" };
             if options.json_output {
@@ -4654,27 +5082,56 @@ async fn run_agent_turn_inner(
                     .get("path")
                     .and_then(Value::as_str)
                     .is_some_and(|path| Path::new(path).is_absolute());
-            let result = if options.no_tools || options.no_project_tools && !public_tool(&call.name)
+            let mut result = if options.no_tools
+                || options.no_project_tools && !public_tool(&call.name)
             {
                 Err("tool is disabled for this invocation".to_string())
             } else if !options.project_trusted
-                && !matches!(
-                    call.name.as_str(),
-                    "read_skill_file" | "web_fetch" | "ask_user"
-                )
+                && !public_tool(&call.name)
                 && !is_explicit_absolute_read
             {
                 Err("project folder is not trusted; project tools are disabled".to_string())
-            } else if !mode_allows_changes(mode) && is_mutating {
+            } else if !mode_allows_changes(mode) && is_mutating && call.name != "install_plugin" {
                 Err(format!(
                     "{} mode does not allow project changes or commands",
                     mode
                 ))
+            } else if !mode_allows_changes(mode) && call.name == "terminal_read" {
+                Err(format!(
+                    "terminal_read is unavailable in {mode} mode; it only reads a session_id from terminal_start in Build mode"
+                ))
+            } else if !agent_tools(mode)
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["function"]["name"].as_str() == Some(call.name.as_str()))
+                && call.name != "list_files"
+            {
+                Err(unknown_tool_error(&call.name, &tools))
             } else {
-                execute_agent_tool(&root, &call, auto_approve_actions, interrupt).await
+                execute_agent_tool(&root, &call, auto_approve_actions, mode, interrupt).await
             };
+            if call.name == "ask_user" && result.is_ok() {
+                let answer = if let Some(answer) = tui::ask_question(&call.arguments) {
+                    answer
+                } else if !options.json_output
+                    && io::stdin().is_terminal()
+                    && io::stdout().is_terminal()
+                {
+                    interrupt.with_terminal_input(|| interactive_question(&call.arguments))
+                } else {
+                    Ok(None)
+                };
+                match answer {
+                    Ok(Some(answer)) => result = Ok(json!({"answer":answer}).to_string()),
+                    Ok(None) => {}
+                    Err(error) => result = Err(error),
+                }
+            }
             let dur = tool_start.elapsed().as_secs_f32();
-            if !options.json_output {
+            if !options.json_output
+                && !matches!(call.name.as_str(), "ask_user" | "request_build_mode")
+            {
                 let newline = if RAW_TTY_MODE.load(Ordering::SeqCst) {
                     "\r\n"
                 } else {
@@ -4741,7 +5198,7 @@ async fn run_agent_turn_inner(
                 Some(output),
                 Some(dur),
             );
-            if call.name == "ask_user" {
+            if matches!(call.name.as_str(), "ask_user" | "request_build_mode") {
                 pending_question = result
                     .as_ref()
                     .ok()
@@ -5158,6 +5615,14 @@ fn choices_from_catalog(models: Vec<ModelInfo>, gateway: &str, label: &str) -> V
     let mut choices = Vec::new();
     let mut has_kilo_auto_free = false;
     for model in models {
+        if gateway == "vercel"
+            && model
+                .model_type
+                .as_deref()
+                .is_some_and(|kind| kind != "language")
+        {
+            continue;
+        }
         has_kilo_auto_free |= gateway == "kilo" && model.id == "kilo-auto/free";
         let free = model.is_free();
         choices.push(ModelChoice {
@@ -5341,6 +5806,17 @@ async fn interactive(options: Options) -> Result<(), String> {
             }
             continue;
         }
+        if !command_mode && (input == ":plugins" || input.starts_with(":plugins ")) {
+            let args = input
+                .split_whitespace()
+                .skip(1)
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            if let Err(error) = plugins_command(&skills_base()?, &args, false).await {
+                eprintln!("nio: {error}");
+            }
+            continue;
+        }
         if !command_mode && (input == ":skills" || input.starts_with(":skills ")) {
             if let Err(error) = interactive_skills(input) {
                 eprintln!("nio: {error}");
@@ -5389,7 +5865,6 @@ async fn interactive(options: Options) -> Result<(), String> {
                 session_id = next_id;
                 history = next_history;
                 visible_followups.clear();
-                clear_backups();
                 if let Ok(mut cached) = LAST_EDIT_DETAILS.lock() {
                     *cached = None;
                 }
@@ -5418,7 +5893,7 @@ async fn interactive(options: Options) -> Result<(), String> {
         }
         if !command_mode && input == ":undo" {
             match undo_last_change(&root) {
-                Ok(msg) => println!("⏪ {msg} ({} remaining)", backup_count()),
+                Ok(msg) => println!("⏪ {msg} ({} remaining)", backup_count(&root).unwrap_or(0)),
                 Err(err) => println!("⚠️  {err}"),
             }
             continue;
@@ -5977,42 +6452,46 @@ fn print_prompt_divider() -> Result<(), String> {
         .map_err(|error| format!("writing prompt divider: {error}"))
 }
 
-const COMMANDS: [(&str, &str); 23] = [
-    (":queue", "List/edit/remove/pause/resume queued messages"),
-    (
-        ":stop",
-        "Stop the current response; preserve queued messages",
-    ),
-    (":skills", "List/add/remove/enable/disable GitHub skills"),
-    (":clear", "Clear conversation history"),
-    (":sessions", "Switch saved session (:history / :histoy)"),
-    (":history", "Switch to a saved conversation"),
-    (":continue", "Continue the unfinished task in this session"),
-    (":diff", "Show git diff of project changes"),
-    (":details", "Expand the latest file edit; d toggles details"),
-    (":undo", "Revert last file change made by Nio"),
-    (":help", "Show available commands"),
-    (":model", "Switch model"),
-    (":mode", "Choose Ask, Plan, or Build mode"),
+const COMMANDS: [(&str, &str); 24] = [
     (
         ":approval",
         "Toggle automatic approval for writes and commands",
     ),
-    (":provider", "Configure model providers"),
-    (":proxy", "Route provider requests through a proxy"),
-    (":path", "Show the current project directory"),
-    (":reasoning", "Set reasoning effort"),
-    (":theme", "Choose the terminal color theme"),
     (":bash", "Switch to a direct shell prompt"),
-    (
-        ":setting",
-        "Configure mode, reasoning, approvals, and other settings",
-    ),
+    (":clear", "Clear conversation history"),
+    (":continue", "Continue the unfinished task in this session"),
+    (":details", "Expand the latest file edit; d toggles details"),
+    (":diff", "Show git diff of project changes"),
+    (":help", "Show available commands"),
+    (":history", "Switch to a saved conversation"),
+    (":mode", "Choose Ask, Plan, or Build mode"),
+    (":model", "Switch model"),
     (
         ":mouse",
         "Toggle click-to-position input; native wheel scrolling is disabled while on",
     ),
+    (":path", "Show the current project directory"),
+    (
+        ":plugins",
+        "Manage optional file readers and PDF OCR languages",
+    ),
+    (":provider", "Configure model providers"),
+    (":proxy", "Route provider requests through a proxy"),
+    (":queue", "List/edit/remove/pause/resume queued messages"),
     (":quit", "Exit Nio"),
+    (":reasoning", "Set reasoning effort"),
+    (":sessions", "Switch to a saved session"),
+    (
+        ":setting",
+        "Configure mode, reasoning, approvals, and other settings",
+    ),
+    (":skills", "List/add/remove/enable/disable GitHub skills"),
+    (
+        ":stop",
+        "Stop the current response; preserve queued messages",
+    ),
+    (":theme", "Choose the terminal color theme"),
+    (":undo", "Revert last file change made by Nio"),
 ];
 
 enum PromptInput {
@@ -7192,6 +7671,7 @@ fn choose_model_index_raw(
     let mut screen = PaletteScreen::new();
     screen.enter_inline();
     let mut query = String::new();
+    let mut provider = None::<String>;
     let mut selected = current_model
         .and_then(|model| choices.iter().position(|choice| choice.selector() == model))
         .unwrap_or(0);
@@ -7201,6 +7681,7 @@ fn choose_model_index_raw(
         selected,
         current_model,
         &query,
+        provider.as_deref(),
         &mut screen,
     )?;
     loop {
@@ -7210,9 +7691,30 @@ fn choose_model_index_raw(
             continue;
         }
         match key.code {
+            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                screen.leave(&mut stdout)?;
+                let filters = model_provider_filters(choices);
+                let items = filters
+                    .iter()
+                    .map(|(id, label)| (label.as_str(), "", id.as_deref() == provider.as_deref()))
+                    .collect::<Vec<_>>();
+                let initial = filters
+                    .iter()
+                    .position(|(id, _)| id.as_deref() == provider.as_deref())
+                    .unwrap_or(0);
+                let result = select_menu_option_b("Filter Models by Provider", &items, initial);
+                // The submenu releases raw mode; restore it for model search.
+                terminal::enable_raw_mode().map_err(|e| e.to_string())?;
+                RAW_TTY_MODE.store(true, Ordering::SeqCst);
+                screen.enter_inline();
+                if let Some(index) = result? {
+                    provider = filters[index].0.clone();
+                    selected = 0;
+                }
+            }
             KeyCode::Up => selected = selected.saturating_sub(1),
             KeyCode::Down => {
-                let matches = filtered_model_indices(choices, &query);
+                let matches = filtered_model_indices(choices, &query, provider.as_deref());
                 selected = selected
                     .saturating_add(1)
                     .min(matches.len().saturating_sub(1));
@@ -7221,13 +7723,13 @@ fn choose_model_index_raw(
                 selected = selected.saturating_sub(PAGE_SIZE);
             }
             KeyCode::Right => {
-                let matches = filtered_model_indices(choices, &query);
+                let matches = filtered_model_indices(choices, &query, provider.as_deref());
                 selected = selected
                     .saturating_add(PAGE_SIZE)
                     .min(matches.len().saturating_sub(1));
             }
             KeyCode::Enter => {
-                let matches = filtered_model_indices(choices, &query);
+                let matches = filtered_model_indices(choices, &query, provider.as_deref());
                 if let Some(choice_index) = matches.get(selected).copied() {
                     screen.leave(&mut stdout)?;
                     return Ok(Some(choice_index));
@@ -7243,6 +7745,7 @@ fn choose_model_index_raw(
                         selected,
                         current_model,
                         &query,
+                        provider.as_deref(),
                         &mut screen,
                     )?;
                     continue;
@@ -7268,7 +7771,7 @@ fn choose_model_index_raw(
             }
             _ => {}
         }
-        let matches = filtered_model_indices(choices, &query);
+        let matches = filtered_model_indices(choices, &query, provider.as_deref());
         selected = selected.min(matches.len().saturating_sub(1));
         draw_model_picker(
             &mut stdout,
@@ -7276,12 +7779,33 @@ fn choose_model_index_raw(
             selected,
             current_model,
             &query,
+            provider.as_deref(),
             &mut screen,
         )?;
     }
 }
 
-fn filtered_model_indices(choices: &[ModelChoice], query: &str) -> Vec<usize> {
+fn model_provider_filters(choices: &[ModelChoice]) -> Vec<(Option<String>, String)> {
+    let mut providers = std::collections::BTreeMap::new();
+    for choice in choices {
+        providers
+            .entry(choice.gateway.clone())
+            .or_insert_with(|| choice.gateway_label.clone());
+    }
+    let mut filters = providers
+        .into_iter()
+        .map(|(id, label)| (Some(id), label))
+        .collect::<Vec<_>>();
+    filters.sort_by(|a, b| a.1.cmp(&b.1));
+    filters.insert(0, (None, "All providers".into()));
+    filters
+}
+
+fn filtered_model_indices(
+    choices: &[ModelChoice],
+    query: &str,
+    provider: Option<&str>,
+) -> Vec<usize> {
     let terms = query
         .split_whitespace()
         .map(str::to_lowercase)
@@ -7290,6 +7814,9 @@ fn filtered_model_indices(choices: &[ModelChoice], query: &str) -> Vec<usize> {
         .iter()
         .enumerate()
         .filter_map(|(index, choice)| {
+            if provider.is_some_and(|id| id != choice.gateway) {
+                return None;
+            }
             let name = choice.name.to_lowercase();
             let gateway = choice.gateway_label.to_lowercase();
             let selector = choice.selector().to_lowercase();
@@ -7310,11 +7837,12 @@ fn draw_model_picker(
     selected: usize,
     current_model: Option<&str>,
     query: &str,
+    provider: Option<&str>,
     screen: &mut PaletteScreen,
 ) -> Result<(), String> {
     const PAGE_SIZE: usize = 25;
     let (width, height) = terminal::size().unwrap_or((80, 24));
-    let matches = filtered_model_indices(choices, query);
+    let matches = filtered_model_indices(choices, query, provider);
     let page = selected / PAGE_SIZE;
     let page_start = page * PAGE_SIZE;
     let page_end = (page_start + PAGE_SIZE).min(matches.len());
@@ -7340,7 +7868,11 @@ fn draw_model_picker(
             .map_err(|error| format!("opening model picker: {error}"))?;
     }
     let search_prompt = "Search model/provider: ";
-    let title = format!(" Models · {} matches ", matches.len());
+    let provider_label = provider
+        .and_then(|id| choices.iter().find(|c| c.gateway == id))
+        .map(|c| c.gateway_label.as_str())
+        .unwrap_or("All providers");
+    let title = format!(" Models · {provider_label} · {} matches ", matches.len());
     let title = clip_terminal_text(&title, box_width.saturating_sub(4));
     let title_width = terminal_text_width(&title);
     write!(
@@ -7387,7 +7919,7 @@ fn draw_model_picker(
     if matches.is_empty() {
         write_row(
             stdout,
-            "No matches. Edit search or press Esc to clear it.",
+            "No matches. Edit search or use Ctrl+P to change provider.",
             false,
         )?;
     }
@@ -7430,7 +7962,7 @@ fn draw_model_picker(
     )?;
     write_row(
         stdout,
-        "↑/↓ move · ←/→ page · Enter select · Esc cancel/search",
+        "↑/↓ move · ←/→ page · Ctrl+P provider · Enter select · Esc back",
         false,
     )?;
     write!(
@@ -7667,6 +8199,98 @@ fn save_user_config(config: &UserConfig) -> Result<(), String> {
     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     let contents = serde_json::to_vec_pretty(config).map_err(|e| e.to_string())?;
     atomic_write(&path, &contents, true, Some(config.revision.as_deref()))
+}
+
+async fn plugins_command(base: &Path, args: &[String], json_output: bool) -> Result<(), String> {
+    if !args.is_empty() || json_output || !io::stdin().is_terminal() || !io::stdout().is_terminal()
+    {
+        return plugins::command(base, args, json_output).await;
+    }
+    let mut view = String::new();
+    let mut languages = Vec::<String>::new();
+    let mut selected = 0;
+    loop {
+        let entries = plugins::menu_entries(base, &view, &languages)?;
+        let title = if view.is_empty() {
+            "Plugins".into()
+        } else if view == "languages" {
+            "PDF OCR languages · select packs, then install".into()
+        } else {
+            format!("Plugin · {view}")
+        };
+        let rows = entries
+            .iter()
+            .map(|e| (e.label.as_str(), e.detail.as_str(), e.active))
+            .collect::<Vec<_>>();
+        let Some(index) = select_menu_option_b(&title, &rows, selected)? else {
+            if view.is_empty() {
+                return Ok(());
+            }
+            view.clear();
+            selected = 0;
+            continue;
+        };
+        selected = index;
+        let args = &entries[index].command;
+        match args[0].as_str() {
+            "menu" => {
+                view = args.get(1).cloned().unwrap_or_default();
+                selected = 0;
+            }
+            "toggle-language" => {
+                let code = &args[1];
+                if languages.contains(code) {
+                    languages.retain(|l| l != code);
+                } else {
+                    languages.push(code.clone());
+                }
+            }
+            "apply-languages" => {
+                if languages.is_empty() {
+                    println!("Select at least one language first.");
+                    continue;
+                }
+                println!("Installing PDF OCR language packs…");
+                match plugins::install(base, "pdf", Some(&languages.join(","))).await {
+                    Ok(message) => {
+                        println!("{message}");
+                        languages.clear();
+                        view = "pdf".into();
+                        selected = 0;
+                    }
+                    Err(error) => eprintln!("nio: {error}"),
+                }
+            }
+            "confirm-remove" => {
+                let items = [
+                    (
+                        "Remove plugin",
+                        "Remove package and downloaded models",
+                        false,
+                    ),
+                    ("Cancel", "Keep this plugin", false),
+                ];
+                if select_menu_option_b(&format!("Remove {}?", args[1]), &items, 1)? == Some(0) {
+                    println!("{}", plugins::manage(base, "remove", &args[1])?);
+                    view.clear();
+                    selected = 0;
+                }
+            }
+            _ => {
+                println!("Updating plugin…");
+                match plugins::command(base, args, false).await {
+                    Ok(()) => {
+                        if args[0] == "install" {
+                            view = "pdf".into();
+                            languages.clear();
+                        }
+                        selected = 0;
+                    }
+                    Err(error) => eprintln!("nio: {error}"),
+                }
+            }
+        }
+    }
 }
 
 async fn configure_provider() -> Result<(), String> {
@@ -8962,6 +9586,10 @@ const HELP_USAGE: &[(&str, &str)] = &[
         "  nio models [--format json] [--free]",
         "List model selectors (free models first)",
     ),
+    (
+        "  nio plugins [ACTION]",
+        "Manage optional file-reader plugins",
+    ),
     ("  nio provider", "Configure a provider interactively"),
     (
         "  nio sessions [list|show <ID>|delete <ID>]",
@@ -8987,6 +9615,10 @@ const HELP_USAGE: &[(&str, &str)] = &[
 ];
 
 const HELP_OPTIONS: &[(&str, &str)] = &[
+    (
+        "      --plugins [ACTION]",
+        "Select/install optional plugins (list in scripts)",
+    ),
     (
         "      --skills [ACTION]",
         "Manage GitHub skills (defaults to list)",
@@ -9020,7 +9652,7 @@ const HELP_OPTIONS: &[(&str, &str)] = &[
     ),
     (
         "      --file <PATH>",
-        "Attach UTF-8 text or PNG/JPEG/GIF/WebP; repeatable",
+        "Attach text, PDF, Office/OpenDocument, or images; repeatable",
     ),
     (
         "      --trust-project",
@@ -9044,6 +9676,10 @@ const HELP_INTERACTIVE: &[(&str, &str)] = &[
     ),
     (":stop", "Stop the response; preserve pending messages"),
     (":skills", "List/add/remove/enable/disable GitHub skills"),
+    (
+        ":plugins",
+        "Manage optional file readers and PDF OCR languages",
+    ),
     (":clear", "Clear conversation history"),
     (":diff", "Show git diff of project changes"),
     (":undo", "Revert last file change made by Nio"),
@@ -9497,8 +10133,8 @@ fn config_set(key: &str, value: &str) -> Result<(), CliError> {
 
 const COMPLETIONS_BASH: &str = r#"_nio_complete() {
     local cur="${COMP_WORDS[COMP_CWORD]}"
-    local opts="--skills --tui --help -h --version -V -m --model -s --session --base-url --api-key --format --dir --auto --trust-project --no-tools --no-project-tools --mode --reasoning --file --variant --all --pure"
-    local cmds="run models provider sessions skills config doctor completions help version"
+    local opts="--plugins --skills --tui --help -h --version -V -m --model -s --session --base-url --api-key --format --dir --auto --trust-project --no-tools --no-project-tools --mode --reasoning --file --variant --all --pure"
+    local cmds="run models provider sessions skills plugins config doctor completions help version"
     if [ "$COMP_CWORD" -eq 1 ]; then
         COMPREPLY=( $(compgen -W "$cmds $opts" -- "$cur") )
     else
@@ -9516,6 +10152,7 @@ cmds=(
   'provider:Configure a provider interactively'
   'sessions:Manage saved sessions'
   'skills:Manage GitHub skills'
+  'plugins:Manage optional plugins'
   'config:Read or change settings'
   'doctor:Check configuration and connectivity'
   'completions:Print a shell completion script'
@@ -9535,6 +10172,7 @@ else
     '--dir[Project directory]:directory:_files' \
     '--mode[Turn mode]:mode:(ask plan build)' \
     '--reasoning[Reasoning effort]:effort:(low medium high default)' \
+    '--plugins[Manage optional plugins]' \
     '--skills[Manage GitHub skills]' \
     '--tui[Open the full-screen interface]' \
     '--trust-project[Trust the project folder]' \
@@ -9550,6 +10188,7 @@ const COMPLETIONS_FISH: &str = r#"complete -c nio -n '__fish_use_subcommand' -a 
 complete -c nio -n '__fish_use_subcommand' -a models -d 'List model selectors'
 complete -c nio -n '__fish_use_subcommand' -a provider -d 'Configure a provider'
 complete -c nio -n '__fish_use_subcommand' -a sessions -d 'Manage saved sessions'
+complete -c nio -n '__fish_use_subcommand' -a plugins -d 'Manage optional plugins'
 complete -c nio -n '__fish_use_subcommand' -a skills -d 'Manage GitHub skills'
 complete -c nio -n '__fish_use_subcommand' -a config -d 'Read or change settings'
 complete -c nio -n '__fish_use_subcommand' -a doctor -d 'Check configuration and connectivity'
@@ -9566,6 +10205,7 @@ complete -c nio -l dir -r -d 'Project directory'
 complete -c nio -l mode -r -a 'ask plan build' -d 'Turn mode'
 complete -c nio -l reasoning -r -a 'low medium high default' -d 'Reasoning effort'
 complete -c nio -l auto -d 'Auto-approve writes and commands'
+complete -c nio -l plugins -d 'Manage optional plugins'
 complete -c nio -l skills -d 'Manage GitHub skills'
 complete -c nio -l tui -d 'Open the full-screen interface'
 complete -c nio -l trust-project -d 'Trust the project folder'
@@ -9869,6 +10509,11 @@ fn print_help(topic: Option<&str>) -> Result<(), String> {
                 "Interactive wizard to add, update, or remove an OpenAI-compatible\n\
                  provider. Saved API keys live in the Nio config file (user-only\n\
                  permissions on Unix). Equivalent to :provider in the interactive UI."
+            );
+        }
+        Some("plugins") => {
+            println!(
+                "nio --plugins [list] [--format json]\nnio --plugins install pdf [--languages eng,khm|all|none]\nnio --plugins languages pdf\nnio --plugins enable NAME\nnio --plugins disable NAME\nnio --plugins remove NAME"
             );
         }
         Some("skills") => {

@@ -10,6 +10,15 @@ license = "MIT"
 name = "nio"
 path = "src/main.rs"
 
+[[bin]]
+name = "nio-pdf"
+path = "src/bin/nio-pdf.rs"
+required-features = ["pdf-plugin"]
+
+[features]
+default = []
+pdf-plugin = ["dep:pdf-extract"]
+
 [dependencies]
 base64 = "0.22"
 crossterm = "0.29"
@@ -20,6 +29,12 @@ regex-lite = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time", "io-util"] }
+calamine = "0.31"
+pdf-extract = { version = "0.10", optional = true }
+quick-xml = "0.38"
+sha2 = "0.10"
+sha1 = "0.10"
+zip = { version = "4", default-features = false, features = ["deflate"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

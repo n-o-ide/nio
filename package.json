@@ -8,7 +8,8 @@
     "nio": "bin/nio.js"
   },
   "scripts": {
-    "start": "node ./bin/nio.js"
+    "start": "node ./bin/nio.js",
+    "test": "node --test tests/*.test.js"
   },
   "repository": {
     "type": "git",

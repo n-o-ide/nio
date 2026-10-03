@@ -4,9 +4,10 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const https = require('https');
-const http = require('http');
 const crypto = require('crypto');
-const { spawn, execSync } = require('child_process');
+const { spawn, execFileSync } = require('child_process');
+const { pipeline } = require('stream/promises');
+const { Transform } = require('stream');
 
 const pkg = require('../package.json');
 const VERSION = pkg.version;
@@ -50,168 +51,123 @@ function getPlatformInfo() {
   return { platform, arch, target, archiveName, ext };
 }
 
-function fetchWithRedirects(url, maxRedirects = 5) {
+const DOWNLOAD_TIMEOUT_MS = 120_000;
+const ARCHIVE_LIMIT = 128 * 1024 * 1024;
+
+function fetchWithRedirects(url, maxRedirects = 5, deadline = Date.now() + DOWNLOAD_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
-    if (maxRedirects <= 0) {
-      return reject(new Error('Too many redirects while downloading binary'));
-    }
-
-    const client = url.startsWith('https:') ? https : http;
-    const req = client.get(url, { headers: { 'User-Agent': `nio-ai-npm/${VERSION}` } }, (res) => {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'https:') return reject(new Error('Downloads require HTTPS'));
+    const remaining = deadline - Date.now();
+    if (maxRedirects < 0 || remaining <= 0) return reject(new Error('Download redirect limit or deadline exceeded'));
+    const req = https.get(parsed, { headers: { 'User-Agent': `nio-ai-npm/${VERSION}` } }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        return resolve(fetchWithRedirects(res.headers.location, maxRedirects - 1));
+        res.resume();
+        try {
+          resolve(fetchWithRedirects(new URL(res.headers.location, parsed).href, maxRedirects - 1, deadline));
+        } catch (error) { reject(error); }
+      } else if (res.statusCode !== 200) {
+        res.resume();
+        reject(new Error(`Failed to download: HTTP ${res.statusCode} from ${url}`));
+      } else {
+        resolve(res);
       }
-      if (res.statusCode !== 200) {
-        return reject(new Error(`Failed to download: HTTP ${res.statusCode} from ${url}`));
-      }
-      resolve(res);
     });
-
+    const timer = setTimeout(() => req.destroy(new Error('Download deadline exceeded')), remaining);
+    req.on('close', () => clearTimeout(timer));
     req.on('error', reject);
   });
 }
 
-function streamToString(stream) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    stream.on('data', (d) => chunks.push(d));
-    stream.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')));
-    stream.on('error', reject);
+async function streamToString(stream, limit = 1024 * 1024) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of stream) {
+    size += chunk.length;
+    if (size > limit) throw new Error('Checksum manifest exceeds size limit');
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+function checksumFor(manifest, archiveName) {
+  const matches = manifest.split(/\r?\n/).map(line => line.trim().split(/\s+/))
+    .filter(parts => parts.length === 2 && parts[1].replace(/^\*/, '') === archiveName);
+  if (matches.length !== 1 || !/^[a-f0-9]{64}$/i.test(matches[0][0])) {
+    throw new Error(`Missing, invalid, or duplicate checksum for ${archiveName}`);
+  }
+  return matches[0][0].toLowerCase();
+}
+
+function binaryMatchesVersion(binary, version = VERSION) {
+  try {
+    fs.accessSync(binary, fs.constants.X_OK);
+    const output = execFileSync(binary, ['--version'], { encoding: 'utf8', timeout: 5000, maxBuffer: 4096, stdio: ['ignore', 'pipe', 'ignore'] });
+    return output.trim() === `nio ${version} (NioAI)`;
+  } catch { return false; }
+}
+
+function binaryCachePath(home, target, ext, version = VERSION) {
+  return path.join(home, '.nio', 'bin', version, target, `nio${ext}`);
+}
+
+async function downloadArchive(stream, destination, expectedHash) {
+  const hasher = crypto.createHash('sha256');
+  let size = 0;
+  const hashStream = new Transform({
+    transform(chunk, encoding, callback) {
+      size += chunk.length;
+      if (size > ARCHIVE_LIMIT) return callback(new Error('Archive exceeds size limit'));
+      hasher.update(chunk);
+      callback(null, chunk);
+    }
   });
+  await pipeline(stream, hashStream, fs.createWriteStream(destination, { flags: 'wx', mode: 0o600 }));
+  if (hasher.digest('hex') !== expectedHash) throw new Error('Checksum verification failed');
 }
 
 async function ensureBinary() {
   const { ext, target, archiveName, platform } = getPlatformInfo();
-
-  // 1. Explicit override via NIO_BIN
   if (process.env.NIO_BIN) {
-    if (fs.existsSync(process.env.NIO_BIN)) {
-      return process.env.NIO_BIN;
-    }
-    console.warn(`[nio-ai] Warning: NIO_BIN set to "${process.env.NIO_BIN}" but file does not exist.`);
+    fs.accessSync(process.env.NIO_BIN, fs.constants.X_OK);
+    return process.env.NIO_BIN;
   }
-
-  // 2. Local target build if running inside repo
   const localTarget = path.join(__dirname, '..', 'target', 'release', `nio${ext}`);
-  if (fs.existsSync(localTarget)) {
-    try {
-      fs.accessSync(localTarget, fs.constants.X_OK);
-      return localTarget;
-    } catch {}
-  }
+  if (binaryMatchesVersion(localTarget)) return localTarget;
 
-  // 3. System PATH check
-  try {
-    const whichCmd = platform === 'win32' ? 'where nio' : 'which nio';
-    const sysBin = execSync(whichCmd, { stdio: ['pipe', 'pipe', 'ignore'] })
-      .toString()
-      .trim()
-      .split(/\r?\n/)[0];
-
-    if (sysBin && fs.existsSync(sysBin)) {
-      try {
-        const verOutput = execSync(`"${sysBin}" --version`, { stdio: ['pipe', 'pipe', 'ignore'] }).toString();
-        if (verOutput.toLowerCase().includes('nio')) {
-          return sysBin;
-        }
-      } catch {}
-    }
-  } catch {}
-
-  // 4. User cache: ~/.nio/bin/nio
-  const cacheDir = path.join(os.homedir(), '.nio', 'bin');
+  // Do not probe nio on PATH: it may be this npm wrapper or an unrelated program.
+  const targetBinPath = binaryCachePath(os.homedir(), target, ext);
+  if (binaryMatchesVersion(targetBinPath)) return targetBinPath;
+  const cacheDir = path.dirname(targetBinPath);
   fs.mkdirSync(cacheDir, { recursive: true });
-
-  const targetBinPath = path.join(cacheDir, `nio${ext}`);
-  if (fs.existsSync(targetBinPath)) {
-    try {
-      fs.accessSync(targetBinPath, fs.constants.X_OK);
-      return targetBinPath;
-    } catch {
-      fs.chmodSync(targetBinPath, 0o755);
-      return targetBinPath;
-    }
-  }
-
-  // 5. Download from GitHub release
   const tag = `v${VERSION}`;
   const baseUrl = `https://github.com/${REPO}/releases/download/${tag}`;
-  const downloadUrl = `${baseUrl}/${archiveName}`;
-  const sumsUrl = `${baseUrl}/SHA256SUMS`;
-
-  console.log(`[nio-ai] Downloading NioAI binary (${tag}, ${archiveName})...`);
-
-  // Fetch SHA256SUMS if available
-  let expectedHash = null;
+  console.error(`[nio-ai] Downloading NioAI binary (${tag}, ${archiveName})...`);
+  const deadline = Date.now() + DOWNLOAD_TIMEOUT_MS;
+  const manifest = await streamToString(await fetchWithRedirects(`${baseUrl}/SHA256SUMS`, 5, deadline));
+  const expectedHash = checksumFor(manifest, archiveName);
+  const temporary = fs.mkdtempSync(path.join(cacheDir, '.download-'));
   try {
-    const sumsRes = await fetchWithRedirects(sumsUrl);
-    const sumsText = await streamToString(sumsRes);
-    for (const line of sumsText.split('\n')) {
-      const parts = line.trim().split(/\s+/);
-      if (parts.length >= 2) {
-        const hash = parts[0];
-        const file = parts[1].replace(/^\*/, '');
-        if (file === archiveName) {
-          expectedHash = hash;
-          break;
-        }
-      }
-    }
-  } catch {}
-
-  const tempArchive = path.join(cacheDir, `.download-${Date.now()}-${archiveName}`);
-  const archiveRes = await fetchWithRedirects(downloadUrl);
-
-  const fileStream = fs.createWriteStream(tempArchive);
-  const hasher = crypto.createHash('sha256');
-
-  await new Promise((resolve, reject) => {
-    archiveRes.on('data', (chunk) => {
-      hasher.update(chunk);
-      fileStream.write(chunk);
-    });
-    archiveRes.on('end', () => fileStream.end(resolve));
-    archiveRes.on('error', (err) => {
-      fileStream.destroy();
-      fs.unlink(tempArchive, () => {});
-      reject(err);
-    });
-  });
-
-  const actualHash = hasher.digest('hex');
-  if (expectedHash && actualHash !== expectedHash) {
-    fs.unlinkSync(tempArchive);
-    throw new Error(`Checksum verification failed for ${archiveName}! Expected ${expectedHash}, got ${actualHash}`);
-  }
-
-  // Extract
-  const tempExtractDir = path.join(cacheDir, `.extract-${Date.now()}`);
-  fs.mkdirSync(tempExtractDir, { recursive: true });
-
-  try {
+    const archive = path.join(temporary, archiveName);
+    await downloadArchive(await fetchWithRedirects(`${baseUrl}/${archiveName}`, 5, deadline), archive, expectedHash);
     if (archiveName.endsWith('.tar.gz')) {
-      execSync(`tar -xzf "${tempArchive}" -C "${tempExtractDir}"`);
-    } else if (archiveName.endsWith('.zip')) {
-      if (platform === 'win32') {
-        execSync(`powershell -Command "Expand-Archive -Path '${tempArchive}' -DestinationPath '${tempExtractDir}' -Force"`);
-      } else {
-        execSync(`unzip -q "${tempArchive}" -d "${tempExtractDir}"`);
-      }
+      execFileSync('tar', ['-xzf', archive, '-C', temporary], { timeout: 30_000 });
+    } else if (platform === 'win32') {
+      const quote = value => "'" + value.replace(/'/g, "''") + "'";
+      execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-Command',
+        `Expand-Archive -LiteralPath ${quote(archive)} -DestinationPath ${quote(temporary)} -Force`], { timeout: 30_000 });
+    } else {
+      execFileSync('unzip', ['-q', archive, '-d', temporary], { timeout: 30_000 });
     }
+    const extracted = path.join(temporary, `nio${ext}`);
+    if (!fs.lstatSync(extracted).isFile()) throw new Error('Archive did not contain a regular nio binary');
+    fs.chmodSync(extracted, 0o755);
+    if (!binaryMatchesVersion(extracted)) throw new Error('Downloaded binary has an unexpected version');
+    fs.renameSync(extracted, targetBinPath);
   } finally {
-    try { fs.unlinkSync(tempArchive); } catch {}
+    fs.rmSync(temporary, { recursive: true, force: true });
   }
-
-  const extractedBin = path.join(tempExtractDir, `nio${ext}`);
-  if (!fs.existsSync(extractedBin)) {
-    throw new Error(`Downloaded archive did not contain nio binary`);
-  }
-
-  fs.chmodSync(extractedBin, 0o755);
-  fs.renameSync(extractedBin, targetBinPath);
-  try { fs.rmSync(tempExtractDir, { recursive: true, force: true }); } catch {}
-
-  console.log(`[nio-ai] NioAI binary ready.`);
+  console.error('[nio-ai] NioAI binary ready.');
   return targetBinPath;
 }
 
@@ -236,8 +192,8 @@ async function main() {
     process.on('SIGTERM', () => forwardSignal('SIGTERM'));
     process.on('SIGHUP', () => forwardSignal('SIGHUP'));
 
-    child.on('exit', (code) => {
-      process.exit(code ?? 0);
+    child.on('exit', (code, signal) => {
+      process.exit(code ?? (signal ? 128 + (os.constants.signals[signal] || 1) : 1));
     });
 
     child.on('error', (err) => {
@@ -250,4 +206,5 @@ async function main() {
   }
 }
 
-main();
+if (require.main === module) main();
+module.exports = { ensureBinary, checksumFor, binaryMatchesVersion, binaryCachePath, downloadArchive, streamToString, fetchWithRedirects };

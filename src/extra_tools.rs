@@ -5,7 +5,6 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 const RESULT_LIMIT: usize = 8_000;
 const FILE_SCAN_LIMIT: usize = 16 * 1024 * 1024;
 const WEB_BODY_LIMIT: usize = 1024 * 1024;
-
 fn text_excerpt(chars: impl Iterator<Item = char>, max_chars: usize, budget: usize) -> String {
     let mut text = String::new();
     let mut encoded_bytes = 0;
@@ -239,7 +238,7 @@ async fn web_bytes(response: reqwest::Response, limit: usize) -> Result<Vec<u8>,
     let mut bytes = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("reading response: {e}"))?;
+        let chunk = chunk.map_err(|e| web_request_error("reading webpage response", e))?;
         if bytes.len() + chunk.len() > limit {
             return Err(format!("response exceeds {limit} bytes"));
         }
@@ -374,21 +373,42 @@ pub fn html_to_text(html: &str) -> String {
         .join("\n")
 }
 
+fn web_request_error(action: &str, error: reqwest::Error) -> String {
+    if error.is_timeout() {
+        return format!(
+            "{action} timed out (20-second request limit). No complete page was read. Try another source URL; do not repeatedly fetch the same failing URL."
+        );
+    }
+    format!("{action} failed: {error}. No complete page was read; try another source.")
+}
+
+fn web_client() -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder()
+        .user_agent(concat!("NioAI/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::limited(5));
+    if let Some(proxy_url) = configured_proxy_url()? {
+        builder =
+            builder.proxy(reqwest::Proxy::all(proxy_url).map_err(|_| "invalid web proxy URL")?);
+    }
+    builder
+        .build()
+        .map_err(|e| format!("building web client: {e}"))
+}
+
 pub async fn web_fetch(args: &Value) -> Result<String, String> {
     let url = web_url(required_arg(args, "url")?)?;
     let offset = limited_usize(args, "offset", 0, WEB_BODY_LIMIT);
     let max_chars = limited_usize(args, "max_chars", 6_000, 8_000).max(1);
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .redirect(reqwest::redirect::Policy::limited(5))
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = web_client()?;
     let response = client
         .get(url)
         .header("Accept", "text/html,text/plain,application/json")
+        .header("Accept-Encoding", "identity")
         .send()
         .await
-        .map_err(|e| format!("fetch failed: {e}"))?;
+        .map_err(|e| web_request_error("fetching webpage", e))?;
     let final_url = response.url().to_string();
     if final_url.len() > 2048 {
         return Err("redirected URL exceeds 2048 bytes".into());
@@ -691,7 +711,9 @@ pub async fn terminal_read(root: &Path, args: &Value) -> Result<String, String> 
         let registry = sessions()
             .lock()
             .map_err(|_| "terminal session registry unavailable")?;
-        let session = registry.get(id).ok_or("unknown terminal session")?;
+        let session = registry.get(id).ok_or_else(|| format!(
+            "Unknown terminal session {id:?}. terminal_read only reads output; it cannot run commands or edit files. Use the session_id returned by a successful terminal_start in this nio process. Sessions do not survive restarts. Do not retry this missing ID. If terminal_start is unavailable in Ask or Plan mode, explain that the user must choose Build with :mode to run commands."
+        ))?;
         if session.root != root {
             return Err("terminal session belongs to a different project".into());
         }
@@ -876,6 +898,10 @@ mod tests {
     #[tokio::test]
     async fn terminals_return_output_and_cancel_with_project_checks() {
         let root = test_root();
+        let missing = terminal_read(&root, &json!({"session_id":"missing-session"}))
+            .await
+            .unwrap_err();
+        assert!(missing.contains("terminal_start") && missing.contains(":mode"));
         let start: Value = serde_json::from_str(
             &terminal_start(
                 &root,

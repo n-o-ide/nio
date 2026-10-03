@@ -45,4 +45,14 @@ jobs:
         run: cargo clippy --all-targets
 
       - name: Run unit & integration tests
-        run: cargo test --verbose
+        run: cargo test --locked --verbose
+
+      - name: Test optional PDF plugin
+        run: cargo test --locked --features pdf-plugin --all-targets
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Test launcher and installers
+        run: npm test

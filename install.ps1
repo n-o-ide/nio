@@ -41,24 +41,20 @@ try {
 
     $ArchiveFile = Join-Path $TempDir $Archive
     Write-Host "⬇️  Downloading NioAI ($Version)..."
-    Invoke-WebRequest -Uri $DownloadUrl -OutFile $ArchiveFile
+    Invoke-WebRequest -Uri $DownloadUrl -OutFile $ArchiveFile -TimeoutSec 120
 
-    # 3. Checksum check if available
-    try {
-        $ChecksumFile = Join-Path $TempDir "SHA256SUMS"
-        Invoke-WebRequest -Uri $ChecksumUrl -OutFile $ChecksumFile -ErrorAction SilentlyContinue
-        if (Test-Path $ChecksumFile) {
-            Write-Host "🔒 Verifying checksum..."
-            $Expected = Select-String -Path $ChecksumFile -Pattern $Archive | ForEach-Object { ($_ -split '\s+')[0] }
-            if ($Expected) {
-                $Actual = (Get-FileHash -Path $ArchiveFile -Algorithm SHA256).Hash.ToLower()
-                if ($Actual -ne $Expected.ToLower()) {
-                    Write-Error "Checksum verification failed! Expected $Expected but got $Actual."
-                    exit 1
-                }
-            }
-        }
-    } catch {}
+    # 3. Require one exact checksum entry; never continue after verification failure.
+    $ChecksumFile = Join-Path $TempDir "SHA256SUMS"
+    Invoke-WebRequest -Uri $ChecksumUrl -OutFile $ChecksumFile -TimeoutSec 120
+    $Entries = @(Get-Content -LiteralPath $ChecksumFile | ForEach-Object {
+        $Parts = $_.Trim() -split '\s+'
+        if ($Parts.Count -eq 2 -and $Parts[1].TrimStart('*') -ceq $Archive) { $Parts[0] }
+    })
+    if ($Entries.Count -ne 1 -or $Entries[0] -notmatch '^[a-fA-F0-9]{64}$') {
+        throw "Missing, invalid, or duplicate checksum for $Archive."
+    }
+    $Actual = (Get-FileHash -LiteralPath $ArchiveFile -Algorithm SHA256).Hash
+    if ($Actual -ne $Entries[0]) { throw "Checksum verification failed!" }
 
     # 4. Extract
     Write-Host "📂 Extracting archive..."
@@ -71,7 +67,20 @@ try {
     }
 
     $DestExe = Join-Path $InstallDir "nio.exe"
-    Copy-Item -Path $SourceExe -Destination $DestExe -Force
+    if (Test-Path -LiteralPath $DestExe) {
+        $Existing = & $DestExe --version
+        if ($LASTEXITCODE -ne 0 -or $Existing -notmatch '^nio \S+ \(NioAI\)$') {
+            throw "Refusing to replace an unrelated nio executable. Choose NIO_INSTALL_DIR."
+        }
+    }
+    $Downloaded = & $SourceExe --version
+    if ($LASTEXITCODE -ne 0 -or $Downloaded -notmatch '^nio \S+ \(NioAI\)$') {
+        throw "Downloaded executable is not NioAI."
+    }
+    if ($Version -ne "latest" -and $Downloaded -cne "nio $($Version.TrimStart('v')) (NioAI)") {
+        throw "Downloaded executable has the wrong version."
+    }
+    Copy-Item -LiteralPath $SourceExe -Destination $DestExe -Force
     Write-Host "✅ Installed nio.exe to $DestExe" -ForegroundColor Green
 
     # 5. Path check

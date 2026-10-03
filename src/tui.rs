@@ -12,16 +12,29 @@ pub fn active() -> bool {
 thread_local! {
     static OUTPUT: RefCell<Option<mpsc::Sender<Value>>> = const { RefCell::new(None) };
     static APPROVAL: RefCell<Option<mpsc::Receiver<bool>>> = const { RefCell::new(None) };
+    static QUESTION: RefCell<Option<mpsc::Receiver<Option<String>>>> = const { RefCell::new(None) };
     static CANCEL: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
 }
 pub fn configure_worker(
     sender: mpsc::Sender<Value>,
     approval: mpsc::Receiver<bool>,
+    question: mpsc::Receiver<Option<String>>,
     cancel: Arc<AtomicBool>,
 ) {
     OUTPUT.with(|value| *value.borrow_mut() = Some(sender));
     APPROVAL.with(|value| *value.borrow_mut() = Some(approval));
+    QUESTION.with(|value| *value.borrow_mut() = Some(question));
     CANCEL.with(|value| *value.borrow_mut() = Some(cancel));
+}
+pub fn ask_question(args: &Value) -> Option<Result<Option<String>, String>> {
+    QUESTION.with(|receiver| {
+        receiver.borrow().as_ref().map(|receiver| {
+            send_event(&json!({"type":"question", "arguments":args}));
+            receiver
+                .recv()
+                .map_err(|_| "question input closed".to_string())
+        })
+    })
 }
 pub fn send_event(value: &Value) -> bool {
     OUTPUT.with(|output| {
@@ -246,6 +259,9 @@ impl Panel {
         self.selected = 0;
     }
 }
+struct QuestionPrompt {
+    custom: bool,
+}
 struct State {
     entries: Vec<Entry>,
     input: String,
@@ -259,9 +275,13 @@ struct State {
     approval: Option<String>,
     approval_preview: Option<String>,
     approval_sender: Option<mpsc::Sender<bool>>,
+    question_sender: Option<mpsc::Sender<Option<String>>>,
+    question: Option<QuestionPrompt>,
+    question_draft: Option<(String, usize, PastedBlocks)>,
     cancel: Option<Arc<AtomicBool>>,
     worker: Option<JoinHandle<()>>,
     receiver: Option<mpsc::Receiver<Value>>,
+    plugin_languages: Vec<String>,
     jobs: Option<mpsc::Receiver<Value>>,
     answer_index: Option<usize>,
     last_diff: Option<String>,
@@ -338,9 +358,11 @@ impl State {
         let root = self.root.clone();
         let (sender, receiver) = mpsc::channel();
         let (approval_sender, approval_receiver) = mpsc::channel();
+        let (question_sender, question_receiver) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         self.cancel = Some(cancel.clone());
         self.approval_sender = Some(approval_sender);
+        self.question_sender = Some(question_sender);
         self.receiver = Some(receiver);
         self.busy = true;
         self.turn_started = Some(Instant::now());
@@ -349,6 +371,7 @@ impl State {
         self.worker = Some(thread::spawn(move || {
             OUTPUT.with(|output| *output.borrow_mut() = Some(sender.clone()));
             APPROVAL.with(|value| *value.borrow_mut() = Some(approval_receiver));
+            QUESTION.with(|value| *value.borrow_mut() = Some(question_receiver));
             CANCEL.with(|value| *value.borrow_mut() = Some(cancel));
             let mut history = history;
             let result = match tokio::runtime::Runtime::new() {
@@ -364,6 +387,36 @@ impl State {
         }));
         Ok(())
     }
+    fn finish_question(&mut self, answer: Option<String>) {
+        if let Some(sender) = &self.question_sender {
+            let _ = sender.send(answer.clone());
+        }
+        if let Some(answer) = answer {
+            self.add("You", answer);
+        }
+        if let Some((input, cursor, pastes)) = self.question_draft.take() {
+            self.input = input;
+            self.cursor = cursor;
+            self.pastes = pastes;
+        }
+        self.question = None;
+        self.panel = None;
+        self.notice = "Working…".into();
+    }
+    fn start_custom_question(&mut self) {
+        self.question_draft = Some((
+            std::mem::take(&mut self.input),
+            self.cursor,
+            std::mem::take(&mut self.pastes),
+        ));
+        self.input.clear();
+        self.cursor = 0;
+        if let Some(question) = &mut self.question {
+            question.custom = true;
+        }
+        self.panel = None;
+        self.notice = "Type your answer and press Enter · Esc skip".into();
+    }
     fn events(&mut self) -> bool {
         let mut events = self
             .receiver
@@ -376,6 +429,15 @@ impl State {
         let changed = !events.is_empty();
         for event in events {
             match event["type"].as_str() {
+                Some("plugins_result") => {
+                    self.jobs = None;
+                    self.add(
+                        "Plugins",
+                        event["text"]
+                            .as_str()
+                            .unwrap_or("Plugin operation finished"),
+                    );
+                }
                 Some("skills_result") => {
                     self.jobs = None;
                     self.add(
@@ -453,6 +515,9 @@ impl State {
                     let part = &event["part"];
                     let status = part["state"]["status"].as_str().unwrap_or_default();
                     let title = part["state"]["title"].as_str().unwrap_or("tool");
+                    if title.trim() == "ask_user" {
+                        continue;
+                    }
                     if status == "running" {
                         self.progress_active = true;
                         self.add("Progress", format!("{title} …"));
@@ -503,6 +568,49 @@ impl State {
                     self.approval_preview = event["preview"].as_str().map(str::to_string);
                     self.notice = "Approval required · Y approve · N deny · D details".into();
                 }
+                Some("question") => {
+                    let title = event["arguments"]["question"]
+                        .as_str()
+                        .unwrap_or("Choose an answer")
+                        .trim()
+                        .to_string();
+                    let options = event["arguments"]["options"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .take(3)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>();
+                    self.progress_active = false;
+                    self.question = Some(QuestionPrompt {
+                        custom: options.is_empty(),
+                    });
+                    if options.is_empty() {
+                        self.add("Nio", &title);
+                        self.question_draft = Some((
+                            std::mem::take(&mut self.input),
+                            self.cursor,
+                            std::mem::take(&mut self.pastes),
+                        ));
+                        self.input.clear();
+                        self.cursor = 0;
+                        self.panel = None;
+                        self.notice = format!("{title} · type your answer and press Enter");
+                    } else {
+                        let mut rows = options;
+                        rows.push("Type your own answer".into());
+                        self.panel = Some(Panel {
+                            title,
+                            rows,
+                            selected: 0,
+                            sessions: None,
+                            commands: None,
+                            search: None,
+                        });
+                        self.notice = "↑/↓ choose · Enter answer · Esc skip".into();
+                    }
+                }
                 Some("complete") => {
                     self.history = event["history"].as_array().cloned().unwrap_or_default();
                     self.busy = false;
@@ -511,6 +619,9 @@ impl State {
                     self.cancel = None;
                     self.approval_sender = None;
                     self.approval = None;
+                    self.question_sender = None;
+                    self.question = None;
+                    self.question_draft = None;
                     self.answer_index = None;
                     if let Some(worker) = self.worker.take() {
                         let _ = worker.join();
@@ -631,7 +742,7 @@ impl State {
         self.panel = Some(Panel {
             title: format!("{title} · Enter selects · Esc closes"),
             rows: items.iter().map(|(label, _)| label.clone()).collect(),
-            search: (title == "Models").then(|| ModelSearch {
+            search: (title == "Models" || title == "PDF OCR languages").then(|| ModelSearch {
                 query: String::new(),
                 items: items.clone(),
             }),
@@ -640,9 +751,35 @@ impl State {
             sessions: None,
         });
     }
+    fn plugin_menu(&mut self, view: &str) -> Result<(), String> {
+        let title = if view.is_empty() {
+            "Plugins".to_string()
+        } else if view == "languages" {
+            "PDF OCR languages".to_string()
+        } else {
+            format!("Plugin · {view}")
+        };
+        let choices = plugins::menu_entries(&skills_base()?, view, &self.plugin_languages)?
+            .into_iter()
+            .map(|entry| {
+                (
+                    format!(
+                        "{}{} · {}",
+                        if entry.active { "✓ " } else { "" },
+                        entry.label,
+                        entry.detail
+                    ),
+                    format!(":plugins {}", entry.command.join(" ")),
+                )
+            })
+            .collect();
+        self.choices(&title, choices);
+        Ok(())
+    }
+
     fn job(&mut self, command: &str, args: Vec<String>) -> Result<(), String> {
         if self.jobs.is_some() {
-            return Err("another skill or model operation is running".into());
+            return Err("another plugin, skill, or model operation is running".into());
         }
         let executable = env::current_exe().map_err(|e| e.to_string())?;
         let (sender, receiver) = mpsc::channel();
@@ -662,10 +799,10 @@ impl State {
                     }
                 }
                 Ok(output) => {
-                    json!({"type":if command=="models"{"models_result"}else{"skills_result"},"text":format!("{}{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr)),"error":String::from_utf8_lossy(&output.stderr)})
+                    json!({"type":if command=="models"{"models_result"}else if command=="plugins"{"plugins_result"}else{"skills_result"},"text":format!("{}{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr)),"error":String::from_utf8_lossy(&output.stderr)})
                 }
                 Err(error) => {
-                    json!({"type":if command=="models"{"models_result"}else{"skills_result"},"text":error.to_string(),"error":error.to_string()})
+                    json!({"type":if command=="models"{"models_result"}else if command=="plugins"{"plugins_result"}else{"skills_result"},"text":error.to_string(),"error":error.to_string()})
                 }
             };
             let _ = sender.send(event);
@@ -689,7 +826,7 @@ impl State {
             },
             ":reasoning" if argument.is_empty()=>self.choices("Reasoning",["default","low","medium","high"].into_iter().map(|value|(value.to_string(),format!(":reasoning {value}"))).collect()),
             ":model" | ":models" if argument.is_empty()=>self.job("models",vec!["--format".into(),"json".into()])?,
-            ":setting" | ":settings"=>self.choices("Settings",vec![(format!("Agent Mode · {}",configured_agent_mode(&self.config)),":mode".into()),("Model".into(),":model".into()),(format!("Automatic approval · {}",self.config.auto_approve_actions.unwrap_or(false)),":approval".into()),("Reasoning".into(),":reasoning".into()),("Theme".into(),":theme".into()),("Skills".into(),":skills".into()),("Proxy".into(),":proxy".into())]),
+            ":setting" | ":settings"=>self.choices("Settings",vec![(format!("Agent Mode · {}",configured_agent_mode(&self.config)),":mode".into()),("Model".into(),":model".into()),(format!("Automatic approval · {}",self.config.auto_approve_actions.unwrap_or(false)),":approval".into()),("Reasoning".into(),":reasoning".into()),("Theme".into(),":theme".into()),("Skills".into(),":skills".into()),("Plugins".into(),":plugins".into()),("Proxy".into(),":proxy".into())]),
             ":proxy" if argument.is_empty()=>{ self.input=":proxy ".into();self.cursor=self.input.chars().count();self.notice="Enter a proxy URL, or :proxy off".into(); },
             ":proxy"=>{self.config.proxy_url=if argument=="off"{None}else{let _=reqwest::Proxy::all(argument).map_err(|e|format!("invalid proxy: {e}"))?;Some(argument.into())};save_user_config(&self.config)?;self.notice="Proxy updated for subsequent requests".into();},
             ":provider"=>{self.choices("Saved providers",self.config.providers.iter().map(|provider|(format!("{} · {}",provider.name,safe_proxy_label(&provider.base_url)),format!(":provider-info {}",provider.id))).collect());},
@@ -697,7 +834,7 @@ impl State {
             ":diff"=>{let output=std::process::Command::new("git").arg("diff").current_dir(&self.root).output().map_err(|e|e.to_string())?;let text=String::from_utf8_lossy(&output.stdout).to_string();self.last_diff=Some(text);self.details();},
             ":undo"=>{if self.busy{return Err("stop the response before undoing a file edit".into());}let restored=undo_last_change(&self.root)?;self.add("Undo",restored);},
             ":quit" | ":q" | ":exit" => return Ok(true),
-            ":stop" => { if let Some(cancel) = &self.cancel { cancel.store(true, Ordering::SeqCst); if let Some(sender) = &self.approval_sender { let _ = sender.send(false); } } QUEUE_PAUSED.store(true, Ordering::SeqCst); self.notice = "Stopping; pending messages preserved".into(); },
+            ":stop" => { if let Some(cancel) = &self.cancel { cancel.store(true, Ordering::SeqCst); if let Some(sender) = &self.approval_sender { let _ = sender.send(false); } if let Some(sender) = &self.question_sender { let _ = sender.send(None); } } QUEUE_PAUSED.store(true, Ordering::SeqCst); self.notice = "Stopping; pending messages preserved".into(); },
             ":queue" => {
                 if argument.is_empty() || argument=="list" {
                     let items=MESSAGE_QUEUE.lock().map_err(|_|"queue unavailable")?.iter().enumerate().map(|(index,message)|(format!("{}. {}",index+1,message.split_whitespace().collect::<Vec<_>>().join(" ")),format!(":queue-edit {}",index+1))).collect();
@@ -733,6 +870,27 @@ impl State {
             ":approval" => { self.config.auto_approve_actions = Some(!self.config.auto_approve_actions.unwrap_or(false)); save_user_config(&self.config)?; },
             ":reasoning" if matches!(argument,"default"|"low"|"medium"|"high") => { self.config.reasoning_effort=Some(argument.into()); save_user_config(&self.config)?; },
             ":path" => { self.add("Path", self.root.display().to_string()); },
+            ":plugins" => {
+                let parts = argument.split_whitespace().collect::<Vec<_>>();
+                match parts.as_slice() {
+                    [] | ["list"] | ["menu"] => self.plugin_menu("")?,
+                    ["menu", view] => self.plugin_menu(view)?,
+                    ["toggle-language", code] => {
+                        if self.plugin_languages.iter().any(|l| l == code) { self.plugin_languages.retain(|l| l != code); }
+                        else { self.plugin_languages.push(code.to_string()); }
+                        self.plugin_menu("languages")?;
+                        if let Some(panel) = &mut self.panel {
+                            panel.selected = panel.commands.as_ref().and_then(|commands| commands.iter().position(|command| command == &format!(":plugins toggle-language {code}"))).unwrap_or(0);
+                        }
+                    }
+                    ["apply-languages"] => {
+                        if self.plugin_languages.is_empty() { self.notice = "Select at least one language first".into(); self.plugin_menu("languages")?; }
+                        else { self.job("plugins", vec!["install".into(), "pdf".into(), "--languages".into(), self.plugin_languages.join(",")])?; self.plugin_languages.clear(); }
+                    }
+                    ["confirm-remove", name] => self.choices("Remove plugin?", vec![(format!("Remove {name} and its language packs"), format!(":plugins remove {name}")), ("Cancel".into(), format!(":plugins menu {name}"))]),
+                    _ => self.job("plugins", parts.iter().map(|s| s.to_string()).collect())?,
+                }
+            }
             ":skills" => {
                 if argument.is_empty() || argument == "list" {
                     let rows=skills::list(&skills_base()?)?.into_iter().map(|skill|format!("{} · {} · {}", skill.name, if skill.enabled {"enabled"} else {"disabled"}, skill.description)).collect();
@@ -951,6 +1109,14 @@ impl State {
             .collect();
         let footer = if let Some(action) = &self.approval {
             format!("Approve {action}? Y/N · D details")
+        } else if self
+            .question
+            .as_ref()
+            .is_some_and(|question| question.custom)
+        {
+            "Type your answer · Enter submits · Esc skips".into()
+        } else if self.question.is_some() {
+            "↑/↓ choose · Enter answers · Esc skips".into()
         } else {
             format!(
                 "{} · Enter {} · F2/:queue list · PgUp/Down scroll · Ctrl+C stop",
@@ -967,7 +1133,11 @@ impl State {
             ),
         )?;
         put(height - 1, &footer)?;
-        let suggestions = command_suggestions(&self.input);
+        let suggestions = if self.question.is_some() {
+            Vec::new()
+        } else {
+            command_suggestions(&self.input)
+        };
         if self.panel.is_none() && !suggestions.is_empty() {
             let rows = suggestions
                 .iter()
@@ -1006,7 +1176,12 @@ impl State {
                 put(
                     panel_start,
                     &format!(
-                        "Search models: {}▏ · {}/{}",
+                        "Search {}: {}▏ · {}/{}",
+                        if panel.title.starts_with("PDF OCR languages") {
+                            "languages"
+                        } else {
+                            "models"
+                        },
                         search.query,
                         panel.rows.len(),
                         search.items.len()
@@ -1015,7 +1190,7 @@ impl State {
                 panel_start += 1;
             }
             let rows = if panel.rows.is_empty() && panel.search.is_some() {
-                vec!["No matching models. Change the search text.".into()]
+                vec!["No matches. Change the search text.".into()]
             } else {
                 selected_rows(&panel.rows, panel.selected, theme.accent)
             };
@@ -1112,6 +1287,9 @@ impl Drop for State {
         if let Some(sender) = &self.approval_sender {
             let _ = sender.send(false);
         }
+        if let Some(sender) = &self.question_sender {
+            let _ = sender.send(None);
+        }
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -1144,9 +1322,13 @@ pub async fn run(options: Options) -> Result<(), String> {
         approval: None,
         approval_preview: None,
         approval_sender: None,
+        question_sender: None,
+        question: None,
+        question_draft: None,
         cancel: None,
         worker: None,
         receiver: None,
+        plugin_languages: Vec::new(),
         jobs: None,
         answer_index: None,
         last_diff: None,
@@ -1303,10 +1485,62 @@ pub async fn run(options: Options) -> Result<(), String> {
                     if let Some(sender) = &state.approval_sender {
                         let _ = sender.send(false);
                     }
+                    if state.question.is_some() {
+                        state.finish_question(None);
+                    }
                     state.approval = None;
                     state.panel = None;
                     QUEUE_PAUSED.store(true, Ordering::SeqCst);
                     state.notice = "Stopping…".into();
+                    continue;
+                }
+                if state.question.is_some() && state.panel.is_some() {
+                    let mut answer = None::<Option<String>>;
+                    let mut custom = false;
+                    if let Some(panel) = &mut state.panel {
+                        match key.code {
+                            KeyCode::Up | KeyCode::Left => {
+                                panel.selected = panel.selected.saturating_sub(1)
+                            }
+                            KeyCode::Down | KeyCode::Right | KeyCode::Tab => {
+                                panel.selected =
+                                    (panel.selected + 1).min(panel.rows.len().saturating_sub(1))
+                            }
+                            KeyCode::Char(digit) if digit.is_ascii_digit() => {
+                                if let Some(index) =
+                                    digit.to_digit(10).and_then(|n| n.checked_sub(1))
+                                {
+                                    let index = index as usize;
+                                    if index < panel.rows.len() {
+                                        panel.selected = index;
+                                    }
+                                }
+                            }
+                            KeyCode::Enter => {
+                                if panel.selected == panel.rows.len().saturating_sub(1) {
+                                    custom = true;
+                                } else {
+                                    answer = Some(Some(panel.rows[panel.selected].clone()));
+                                }
+                            }
+                            KeyCode::Esc => answer = Some(None),
+                            _ => {}
+                        }
+                    }
+                    if custom {
+                        state.start_custom_question();
+                    } else if let Some(answer) = answer {
+                        state.finish_question(answer);
+                    }
+                    continue;
+                }
+                if state
+                    .question
+                    .as_ref()
+                    .is_some_and(|question| question.custom)
+                    && key.code == KeyCode::Esc
+                {
+                    state.finish_question(None);
                     continue;
                 }
                 if state
@@ -1447,7 +1681,11 @@ pub async fn run(options: Options) -> Result<(), String> {
                     }
                     continue;
                 }
-                let suggestions = command_suggestions(&state.input);
+                let suggestions = if state.question.is_some() {
+                    Vec::new()
+                } else {
+                    command_suggestions(&state.input)
+                };
                 match key.code {
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         if state.busy {
@@ -1530,6 +1768,17 @@ pub async fn run(options: Options) -> Result<(), String> {
                         insert_text_at_cursor(&mut state.input, &mut state.cursor, "\n")
                     }
                     KeyCode::Enter => {
+                        if state
+                            .question
+                            .as_ref()
+                            .is_some_and(|question| question.custom)
+                        {
+                            let answer = state.pastes.expand(&state.input).trim().to_string();
+                            if !answer.is_empty() {
+                                state.finish_question(Some(answer));
+                            }
+                            continue;
+                        }
                         let mut input = state.pastes.expand(&state.input);
                         if !suggestions.is_empty()
                             && !COMMANDS.iter().any(|(command, _)| *command == input)
@@ -1581,6 +1830,9 @@ pub async fn run(options: Options) -> Result<(), String> {
                             }
                             if let Some(sender) = &state.approval_sender {
                                 let _ = sender.send(false);
+                            }
+                            if let Some(sender) = &state.question_sender {
+                                let _ = sender.send(None);
                             }
                         }
                     }

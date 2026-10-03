@@ -1,4 +1,5 @@
 use super::*;
+use crossterm::cursor::{Hide, Show};
 
 #[derive(Default)]
 pub struct Draft {
@@ -115,16 +116,24 @@ pub fn manage() -> Result<(), String> {
 struct Worker {
     cancel: Arc<AtomicBool>,
     approve: mpsc::Sender<bool>,
+    answer: mpsc::Sender<Option<String>>,
     thread: Option<JoinHandle<()>>,
 }
 impl Drop for Worker {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::SeqCst);
         let _ = self.approve.send(false);
+        let _ = self.answer.send(None);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
     }
+}
+struct ApprovalPrompt {
+    action: String,
+    details: Option<String>,
+    selected_yes: bool,
+    details_visible: bool,
 }
 struct Live {
     draft: Draft,
@@ -139,7 +148,7 @@ struct Live {
     pending: String,
     formatter: Option<MarkdownFormatter>,
     screen: InputRenderState,
-    approval: Option<(String, Option<String>)>,
+    approval: Option<ApprovalPrompt>,
 }
 impl Live {
     fn commit(&mut self, text: &str) -> Result<(), String> {
@@ -210,11 +219,79 @@ impl Live {
         if !self.pending.is_empty() {
             lines.push(clip_terminal_text(&self.pending, width.saturating_sub(1)));
         }
-        if let Some((action, _)) = &self.approval {
-            lines.push(clip_terminal_text(
-                &format!("Approve {action}? Y/N · Ctrl+C stop"),
-                width.saturating_sub(1),
-            ));
+        if let Some(approval) = &self.approval {
+            lines.clear();
+            if approval.details_visible
+                && let Some(details) = &approval.details
+            {
+                lines.extend(
+                    wrap_saved_message(details, width.saturating_sub(2))
+                        .into_iter()
+                        .take(4)
+                        .map(|line| clip_terminal_text(&line, width.saturating_sub(1))),
+                );
+                lines.push(String::new());
+            }
+            let choices = [
+                format!(
+                    " {}  Yes · Approve this action",
+                    if approval.selected_yes {
+                        "\x1b[1;36m›\x1b[0m"
+                    } else {
+                        " "
+                    }
+                ),
+                format!(
+                    " {}  No · Decline",
+                    if approval.selected_yes {
+                        " "
+                    } else {
+                        "\x1b[1;36m›\x1b[0m"
+                    }
+                ),
+            ];
+            let selected = if approval.selected_yes { 0 } else { 1 };
+            let rendered = render_inline_menu(
+                &format!("Approve · {}", approval.action),
+                &choices,
+                selected,
+                if approval.details.is_some() {
+                    if approval.details_visible {
+                        "↑/↓ choose · Enter confirm · y/n shortcut · d hide details · Esc cancel"
+                    } else {
+                        "↑/↓ choose · Enter confirm · y/n shortcut · d show details · Esc cancel"
+                    }
+                } else {
+                    "↑/↓ choose · Enter confirm · y/n shortcut · Esc cancel"
+                },
+                width,
+                height as usize,
+                78,
+            );
+            lines.extend(rendered.split("\r\n").map(str::to_string));
+            let excess = lines.len().saturating_sub(height.max(1) as usize);
+            lines.drain(..excess);
+            let mut stdout = io::stdout();
+            clear_input_region(&mut stdout, &mut self.screen)?;
+            for (index, line) in lines.iter().enumerate() {
+                if index > 0 {
+                    write!(stdout, "\r\n").map_err(|e| e.to_string())?;
+                }
+                write!(stdout, "{line}").map_err(|e| e.to_string())?;
+            }
+            queue!(stdout, Hide).map_err(|e| e.to_string())?;
+            let end_row = lines.len().saturating_sub(1) as u16;
+            self.screen = InputRenderState {
+                rows: lines.len() as u16,
+                end_row,
+                end_column: lines
+                    .last()
+                    .map(|row| terminal_text_width(row) as u16)
+                    .unwrap_or(0),
+                cursor_row: end_row,
+                cursor_column: 0,
+            };
+            return stdout.flush().map_err(|e| e.to_string());
         }
         if self.queue_open {
             let rendered = render_inline_menu(
@@ -311,6 +388,7 @@ impl Live {
             queue!(stdout, MoveUp(end_row - cursor_row)).map_err(|e| e.to_string())?;
         }
         queue!(stdout, MoveToColumn(position.1)).map_err(|e| e.to_string())?;
+        queue!(stdout, Show).map_err(|e| e.to_string())?;
         self.screen = InputRenderState {
             rows: lines.len() as u16,
             end_row,
@@ -341,15 +419,30 @@ impl Live {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             worker.cancel.store(true, Ordering::SeqCst);
             let _ = worker.approve.send(false);
+            self.approval = None;
             QUEUE_PAUSED.store(true, Ordering::SeqCst);
             self.status = "Stopping; queue preserved".into();
             return Ok(());
         }
-        if self.approval.is_some() && matches!(key.code, KeyCode::Char('y' | 'Y' | 'n' | 'N')) {
-            let _ = worker
-                .approve
-                .send(matches!(key.code, KeyCode::Char('y' | 'Y')));
-            self.approval = None;
+        if let Some(approval) = &mut self.approval {
+            let answer = match key.code {
+                KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+                    approval.selected_yes = !approval.selected_yes;
+                    None
+                }
+                KeyCode::Enter => Some(approval.selected_yes),
+                KeyCode::Char('y' | 'Y') => Some(true),
+                KeyCode::Char('n' | 'N') | KeyCode::Esc => Some(false),
+                KeyCode::Char('d' | 'D') => {
+                    approval.details_visible = !approval.details_visible;
+                    None
+                }
+                _ => None,
+            };
+            if let Some(approved) = answer {
+                let _ = worker.approve.send(approved);
+                self.approval = None;
+            }
             return Ok(());
         }
         if self.queue_open && self.editing.is_none() {
@@ -510,10 +603,11 @@ pub async fn run(
     let mut saved_history = history.clone();
     let (sender, receiver) = mpsc::channel();
     let (approve, approvals) = mpsc::channel();
+    let (answer, answers) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
     let cancelled = cancel.clone();
     let thread = thread::spawn(move || {
-        tui::configure_worker(sender.clone(), approvals, cancelled);
+        tui::configure_worker(sender.clone(), approvals, answers, cancelled);
         let result = match tokio::runtime::Runtime::new() {
             Ok(runtime) => runtime.block_on(async {
                 run_agent_turn(&options, &model, &prompt, &mut saved_history).await?;
@@ -534,6 +628,7 @@ pub async fn run(
     let worker = Worker {
         cancel,
         approve,
+        answer,
         thread: Some(thread),
     };
     let mut guard = RawModeGuard::acquire()?;
@@ -589,6 +684,9 @@ pub async fn run(
                     if matches!(state, "completed" | "error") {
                         live.flush_partial()?;
                         let title = part["state"]["title"].as_str().unwrap_or("tool");
+                        if title.trim() == "ask_user" || title.trim() == "request_build_mode" {
+                            continue;
+                        }
                         let output = part["state"]["output"].as_str().unwrap_or_default();
                         if output.starts_with("Edited ") && output.contains("diff --git") {
                             if let Ok(mut cache) = LAST_EDIT_DETAILS.lock() {
@@ -625,10 +723,25 @@ pub async fn run(
                     }
                 }
                 Some("approval") => {
-                    live.approval = Some((
-                        event["action"].as_str().unwrap_or("action").into(),
-                        event["preview"].as_str().map(str::to_string),
-                    ));
+                    let details = event["preview"].as_str().map(str::to_string);
+                    live.approval = Some(ApprovalPrompt {
+                        action: event["action"].as_str().unwrap_or("action").into(),
+                        details_visible: details.is_some(),
+                        details,
+                        selected_yes: false,
+                    });
+                }
+                Some("question") => {
+                    live.flush_partial()?;
+                    live.clear()?;
+                    guard.release();
+                    let answer_result = interactive_question(&event["arguments"]);
+                    let _ = worker
+                        .answer
+                        .send(answer_result.as_ref().ok().cloned().flatten());
+                    guard = RawModeGuard::acquire()?;
+                    answer_result?;
+                    live.draw()?;
                 }
                 Some("inline_complete") => {
                     elapsed = started.elapsed();

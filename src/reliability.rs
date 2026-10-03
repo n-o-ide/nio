@@ -150,6 +150,15 @@ pub fn atomic_write_project(
     data: &[u8],
     expected: Option<Option<&[u8]>>,
 ) -> Result<(), String> {
+    replace_project_file(root, path, Some(data), expected)
+}
+
+fn replace_project_file(
+    root: &Path,
+    path: &Path,
+    data: Option<&[u8]>,
+    expected: Option<Option<&[u8]>>,
+) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::ffi::CString;
@@ -258,6 +267,20 @@ pub fn atomic_write_project(
                 }
             }
 
+            let Some(data) = data else {
+                if old.is_some()
+                    && unsafe { libc::unlinkat(dir.as_raw_fd(), target.as_ptr(), 0) } != 0
+                {
+                    return Err(format!(
+                        "deleting project file: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+                return dir
+                    .sync_all()
+                    .map_err(|e| format!("syncing project directory: {e}"));
+            };
+
             let temp_text = format!(
                 ".nio-{}-{}.tmp",
                 std::process::id(),
@@ -343,8 +366,25 @@ pub fn atomic_write_project(
     }
     #[cfg(not(unix))]
     {
-        let _ = root;
-        atomic_write(path, data, false, expected)
+        let input = path.to_str().ok_or("path is not valid UTF-8")?;
+        let checked = super::resolve_project_path(root, input, false)?;
+        if checked != path {
+            return Err("project path changed".into());
+        }
+        match data {
+            Some(data) => atomic_write(path, data, false, expected),
+            None => {
+                let _lock = lock_file(&lock_path(path))?;
+                let current = optional_read(path, FILE_LIMIT)?;
+                if expected.is_some_and(|expected| current.as_deref() != expected) {
+                    return Err("file changed since it was read".into());
+                }
+                if current.is_some() {
+                    std::fs::remove_file(path).map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -633,57 +673,154 @@ pub fn apply_patch(
     Ok(file_content.replacen(old_content, new_content, 1))
 }
 
-#[derive(Clone, Debug)]
-pub struct BackupEntry {
-    pub path: PathBuf,
-    pub original: Option<Vec<u8>>,
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct BackupEntry {
+    path: PathBuf,
+    original: Option<Vec<u8>>,
+    written: Vec<u8>,
 }
 
-static BACKUP_STACK: std::sync::Mutex<Vec<BackupEntry>> = std::sync::Mutex::new(Vec::new());
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct UndoJournal {
+    version: u32,
+    root: PathBuf,
+    entries: Vec<BackupEntry>,
+}
 
-pub fn record_backup(path: PathBuf, original: Option<Vec<u8>>) {
-    if let Ok(mut stack) = BACKUP_STACK.lock() {
-        stack.push(BackupEntry { path, original });
+const UNDO_LIMIT: usize = 8 * 1024 * 1024;
+
+fn undo_path(root: &Path) -> Result<PathBuf, String> {
+    // Stable FNV-1a identifies the path across Rust/toolchain upgrades. The
+    // stored root is checked separately, so collisions cannot mix projects.
+    let encoded = serde_json::to_vec(root).map_err(|e| e.to_string())?;
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in encoded {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+    }
+    let config = super::config_path()?;
+    Ok(config
+        .parent()
+        .ok_or("config has no parent")?
+        .join("undo")
+        .join(format!("{hash:016x}.json")))
+}
+
+fn load_undo(path: &Path, root: &Path) -> Result<UndoJournal, String> {
+    let Some(bytes) = optional_read(path, UNDO_LIMIT)? else {
+        return Ok(UndoJournal {
+            version: 1,
+            root: root.to_path_buf(),
+            entries: Vec::new(),
+        });
+    };
+    let journal: UndoJournal =
+        serde_json::from_slice(&bytes).map_err(|e| format!("invalid undo journal: {e}"))?;
+    if journal.version != 1 || journal.root != root {
+        return Err("undo journal belongs to a different project or unsupported version".into());
+    }
+    Ok(journal)
+}
+
+fn save_undo(path: &Path, journal: &mut UndoJournal) -> Result<(), String> {
+    loop {
+        let bytes = serde_json::to_vec(journal).map_err(|e| e.to_string())?;
+        if bytes.len() <= UNDO_LIMIT && journal.entries.len() <= 32 {
+            return atomic_write(path, &bytes, true, None);
+        }
+        if journal.entries.len() <= 1 {
+            return Err("undo entry exceeds storage limit".into());
+        }
+        journal.entries.remove(0);
     }
 }
 
-pub fn clear_backups() {
-    if let Ok(mut stack) = BACKUP_STACK.lock() {
-        stack.clear();
+/// Save recovery data before replacing a file. The operation lock serializes
+/// edits and undo across processes; the file writer separately checks content.
+pub fn write_with_backup(
+    root: &Path,
+    path: &Path,
+    data: &[u8],
+    original: Option<&[u8]>,
+) -> Result<(), String> {
+    write_with_journal(root, path, data, original, &undo_path(root)?)
+}
+
+fn write_with_journal(
+    root: &Path,
+    path: &Path,
+    data: &[u8],
+    original: Option<&[u8]>,
+    journal_path: &Path,
+) -> Result<(), String> {
+    let _lock = lock_file(&journal_path.with_extension("active.lock"))?;
+    let mut journal = load_undo(journal_path, root)?;
+    let previous = journal.clone();
+    journal.entries.push(BackupEntry {
+        path: path.to_path_buf(),
+        original: original.map(Vec::from),
+        written: data.to_vec(),
+    });
+    save_undo(journal_path, &mut journal)?;
+    if let Err(error) = atomic_write_project(root, path, data, Some(original)) {
+        // A directory-sync error can occur after replacement: retain recovery
+        // data if the intended bytes were actually written.
+        if !error.starts_with("syncing")
+            && optional_read(path, FILE_LIMIT).is_ok_and(|current| current.as_deref() != Some(data))
+        {
+            journal = previous;
+            save_undo(journal_path, &mut journal)
+                .map_err(|e| format!("{error}; preserving undo history failed: {e}"))?;
+        }
+        return Err(error);
     }
+    Ok(())
 }
 
-pub fn pop_backup() -> Option<BackupEntry> {
-    BACKUP_STACK.lock().ok()?.pop()
-}
-
-pub fn backup_count() -> usize {
-    BACKUP_STACK.lock().map(|s| s.len()).unwrap_or(0)
+pub fn backup_count(root: &Path) -> Result<usize, String> {
+    Ok(load_undo(&undo_path(root)?, root)?.entries.len())
 }
 
 pub fn undo_last_change(root: &Path) -> Result<String, String> {
-    let entry = pop_backup().ok_or_else(|| "No file changes in history to undo.".to_string())?;
-    match entry.original {
-        Some(bytes) => {
-            let current = optional_read(&entry.path, FILE_LIMIT)?;
-            atomic_write_project(root, &entry.path, &bytes, Some(current.as_deref()))?;
-            Ok(format!(
-                "Restored '{}' ({} bytes)",
-                entry.path.display(),
-                bytes.len()
-            ))
-        }
-        None => {
-            if entry.path.exists() {
-                std::fs::remove_file(&entry.path)
-                    .map_err(|e| format!("deleting created file: {e}"))?;
-            }
-            Ok(format!(
-                "Deleted newly created file '{}'",
-                entry.path.display()
-            ))
-        }
+    undo_from_journal(root, &undo_path(root)?)
+}
+
+fn undo_from_journal(root: &Path, journal_path: &Path) -> Result<String, String> {
+    let _lock = lock_file(&journal_path.with_extension("active.lock"))?;
+    let mut journal = load_undo(journal_path, root)?;
+    let entry = journal
+        .entries
+        .last()
+        .ok_or("No file changes in history to undo.")?;
+    let input = entry.path.to_str().ok_or("undo path is not valid UTF-8")?;
+    let checked = super::resolve_project_path(root, input, false)?;
+    if checked != entry.path {
+        return Err("undo path changed".into());
     }
+    let current = optional_read(&entry.path, FILE_LIMIT)?;
+    // Already-restored content makes recovery idempotent after a crash between
+    // restoring a file and updating its journal.
+    if current.as_deref() != entry.original.as_deref() {
+        if current.as_deref() != Some(entry.written.as_slice()) {
+            return Err(format!(
+                "'{}' changed after Nio's edit; undo refused to protect your later changes. Recovery history was kept.",
+                entry.path.display()
+            ));
+        }
+        replace_project_file(
+            root,
+            &entry.path,
+            entry.original.as_deref(),
+            Some(Some(&entry.written)),
+        )?;
+    }
+    let message = if entry.original.is_some() {
+        format!("Restored '{}'", entry.path.display())
+    } else {
+        format!("Deleted newly created file '{}'", entry.path.display())
+    };
+    journal.entries.pop();
+    save_undo(journal_path, &mut journal)?;
+    Ok(message)
 }
 
 pub struct CommandGuard {
@@ -829,15 +966,146 @@ mod tests {
     fn backup_and_undo_restores_original_file() {
         let root = temp_path("undo_root");
         std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
         let file_path = root.join("test.txt");
         std::fs::write(&file_path, b"original content").unwrap();
 
-        super::record_backup(file_path.clone(), Some(b"original content".to_vec()));
-        std::fs::write(&file_path, b"modified content").unwrap();
-
-        let result = super::undo_last_change(&root).unwrap();
+        let journal = root.join("undo.json");
+        super::write_with_journal(
+            &root,
+            &file_path,
+            b"modified content",
+            Some(b"original content"),
+            &journal,
+        )
+        .unwrap();
+        let result = super::undo_from_journal(&root, &journal).unwrap();
         assert!(result.contains("Restored"));
         assert_eq!(std::fs::read(&file_path).unwrap(), b"original content");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn undo_preserves_later_edits_and_can_retry_from_persisted_history() {
+        let root = temp_path("undo_conflict");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let file = root.join("file.txt");
+        let journal = root.join("undo.json");
+        std::fs::write(&file, b"original").unwrap();
+        super::write_with_journal(&root, &file, b"agent", Some(b"original"), &journal).unwrap();
+        std::fs::write(&file, b"user edit").unwrap();
+        assert!(
+            super::undo_from_journal(&root, &journal)
+                .unwrap_err()
+                .contains("later changes")
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), b"user edit");
+        assert_eq!(super::load_undo(&journal, &root).unwrap().entries.len(), 1);
+        std::fs::write(&file, b"agent").unwrap();
+        super::undo_from_journal(&root, &journal).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"original");
+        assert!(
+            super::load_undo(&journal, &root)
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn undo_created_file_checks_content_and_failed_writes_keep_history() {
+        let root = temp_path("undo_create");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let file = root.join("new.txt");
+        let journal = root.join("undo.json");
+        super::write_with_journal(&root, &file, b"agent", None, &journal).unwrap();
+        assert!(super::write_with_journal(&root, &file, b"bad", Some(b"stale"), &journal).is_err());
+        assert_eq!(super::load_undo(&journal, &root).unwrap().entries.len(), 1);
+        std::fs::write(&file, b"later").unwrap();
+        assert!(super::undo_from_journal(&root, &journal).is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), b"later");
+        std::fs::write(&file, b"agent").unwrap();
+        super::undo_from_journal(&root, &journal).unwrap();
+        assert!(!file.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn undo_history_is_project_bound_and_idempotent_after_restore() {
+        let root = temp_path("undo_binding");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let file = root.join("file.txt");
+        let journal = root.join("undo.json");
+        std::fs::write(&file, b"original").unwrap();
+        super::write_with_journal(&root, &file, b"agent", Some(b"original"), &journal).unwrap();
+        assert!(super::load_undo(&journal, &root.join("other")).is_err());
+        std::fs::write(&file, b"original").unwrap();
+        super::undo_from_journal(&root, &journal).unwrap();
+        assert!(
+            super::load_undo(&journal, &root)
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&journal).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn undo_storage_caps_entries_and_serialized_bytes() {
+        let root = temp_path("undo_bounds");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let path = root.join("undo.json");
+        let entry = super::BackupEntry {
+            path: root.join("file.txt"),
+            original: Some(b"before".to_vec()),
+            written: b"after".to_vec(),
+        };
+        let mut journal = super::UndoJournal {
+            version: 1,
+            root: root.clone(),
+            entries: vec![entry.clone(); 40],
+        };
+        super::save_undo(&path, &mut journal).unwrap();
+        assert_eq!(super::load_undo(&path, &root).unwrap().entries.len(), 32);
+        let large = super::BackupEntry {
+            original: Some(vec![255; super::FILE_LIMIT]),
+            written: vec![255; super::FILE_LIMIT],
+            ..entry
+        };
+        journal.entries = vec![large; 3];
+        super::save_undo(&path, &mut journal).unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() <= super::UNDO_LIMIT as u64);
+        assert!(!super::load_undo(&path, &root).unwrap().entries.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn undo_rejects_replaced_parent_symlink_and_keeps_entry() {
+        use std::os::unix::fs::symlink;
+        let root = temp_path("undo_symlink");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let file = root.join("sub/new.txt");
+        let journal = root.join("undo.json");
+        super::write_with_journal(&root, &file, b"agent", None, &journal).unwrap();
+        std::fs::rename(root.join("sub"), root.join("moved")).unwrap();
+        symlink(root.join("moved"), root.join("sub")).unwrap();
+        assert!(super::undo_from_journal(&root, &journal).is_err());
+        assert_eq!(std::fs::read(root.join("moved/new.txt")).unwrap(), b"agent");
+        assert_eq!(super::load_undo(&journal, &root).unwrap().entries.len(), 1);
         std::fs::remove_dir_all(root).unwrap();
     }
 }
