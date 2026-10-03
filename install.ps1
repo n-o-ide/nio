@@ -4,7 +4,7 @@ $ErrorActionPreference = "Stop"
 $Repo = "nio-labs/nio"
 $InstallDir = if ($env:NIO_INSTALL_DIR) { $env:NIO_INSTALL_DIR } else { "$env:LOCALAPPDATA\Programs\Nio" }
 
-Write-Host "📦 NioAI Windows Installer" -ForegroundColor Cyan
+Write-Host "==> NioAI Windows Installer" -ForegroundColor Cyan
 
 # 1. Detect architecture
 $Arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
@@ -19,7 +19,7 @@ switch ($Arch) {
 
 $Target = "$TargetArch-pc-windows-msvc"
 $Archive = "nio-$Target.zip"
-Write-Host "🔍 Detected target: $Target"
+Write-Host "==> Detected target: $Target"
 
 # 2. Setup paths
 if (-not (Test-Path $InstallDir)) {
@@ -40,7 +40,7 @@ try {
     }
 
     $ArchiveFile = Join-Path $TempDir $Archive
-    Write-Host "⬇️  Downloading NioAI ($Version)..."
+    Write-Host "==> Downloading NioAI ($Version)..."
     Invoke-WebRequest -Uri $DownloadUrl -OutFile $ArchiveFile -TimeoutSec 120
 
     # 3. Require one exact checksum entry; never continue after verification failure.
@@ -57,7 +57,7 @@ try {
     if ($Actual -ne $Entries[0]) { throw "Checksum verification failed!" }
 
     # 4. Extract
-    Write-Host "📂 Extracting archive..."
+    Write-Host "==> Extracting archive..."
     Expand-Archive -Path $ArchiveFile -DestinationPath $TempDir -Force
 
     $SourceExe = Join-Path $TempDir "nio.exe"
@@ -81,19 +81,19 @@ try {
         throw "Downloaded executable has the wrong version."
     }
     Copy-Item -LiteralPath $SourceExe -Destination $DestExe -Force
-    Write-Host "✅ Installed nio.exe to $DestExe" -ForegroundColor Green
+    Write-Host "==> Installed nio.exe to $DestExe" -ForegroundColor Green
 
     # 5. Path check
     $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
     if ($UserPath -notlike "*$InstallDir*") {
         [Environment]::SetEnvironmentVariable("Path", "$UserPath;$InstallDir", "User")
-        Write-Host "📌 Added $InstallDir to user PATH." -ForegroundColor Yellow
+        Write-Host "==> Added $InstallDir to user PATH." -ForegroundColor Yellow
         $env:PATH = "$env:PATH;$InstallDir"
     }
 
     if (Test-Path $DestExe) {
         & $DestExe --version
-        Write-Host "🚀 Run 'nio' to start coding!" -ForegroundColor Green
+        Write-Host "Run 'nio' to start coding!" -ForegroundColor Green
     }
 } finally {
     if (Test-Path $TempDir) {

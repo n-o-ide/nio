@@ -12,6 +12,11 @@ const { checksumFor, binaryCachePath, binaryMatchesVersion, downloadArchive, str
 
 const hash = value => crypto.createHash('sha256').update(value).digest('hex');
 const temporary = () => fs.mkdtempSync(path.join(os.tmpdir(), 'nio-install-test-'));
+const cleanup = target => {
+  try {
+    fs.rmSync(target, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  } catch {}
+};
 
 test('cache separates package versions and platforms', () => {
   const first = binaryCachePath('/cache', 'linux', '', '0.3.1');
@@ -43,7 +48,7 @@ test('archive pipeline verifies hashes and propagates stream and file errors', a
     const broken = new Readable({ read() { this.destroy(new Error('interrupted')); } });
     await assert.rejects(downloadArchive(broken, path.join(root, 'partial'), hash('data')), /interrupted/);
     await assert.rejects(streamToString(Readable.from([Buffer.alloc(20)]), 10), /size limit/);
-  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  } finally { cleanup(root); }
 });
 
 test('binary identity rejects old versions and unrelated nio programs', { skip: process.platform === 'win32' }, () => {
@@ -54,7 +59,7 @@ test('binary identity rejects old versions and unrelated nio programs', { skip: 
       fs.writeFileSync(file, `#!/bin/sh\nprintf '%s\\n' '${output}'\n`, { mode: 0o755 });
       assert.equal(binaryMatchesVersion(file, '0.3.2'), expected);
     }
-  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  } finally { cleanup(root); }
 });
 
 test('launcher upgrades a stale cache, verifies before extraction, and reuses the matching version', { skip: process.platform === 'win32' }, async () => {
@@ -111,7 +116,7 @@ test('launcher upgrades a stale cache, verifies before extraction, and reuses th
     assert.equal(await launcher.ensureBinary(), cached);
     assert.equal(downloads.length, 3);
     assert.equal(fs.readdirSync(path.dirname(cached)).some(name => name.startsWith('.download-')), false);
-  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  } finally { cleanup(root); }
 });
 
 test('shell installer refuses unverifiable downloads and preserves an existing executable', { skip: process.platform === 'win32' }, () => {
@@ -164,7 +169,7 @@ esac
     assert.equal(result.status, 0, result.stderr);
     assert.equal(binaryMatchesVersion(destination, '0.3.2'), true);
     assert.equal(fs.readdirSync(install).some(name => name.startsWith('.nio-install')), false);
-  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  } finally { cleanup(root); }
 });
 
 test('PowerShell installer requires checksums before extraction and cleans up failures', { skip: process.platform !== 'win32' }, () => {
@@ -209,5 +214,5 @@ function Expand-Archive {
     fs.writeFileSync(sums, `${checksum}  ${name}\n`);
     assert.match(run().stderr, /Verified archive reached extraction/);
     assert.deepEqual(fs.readdirSync(temporaryDownloads), []);
-  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  } finally { cleanup(root); }
 });
