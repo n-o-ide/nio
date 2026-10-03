@@ -163,39 +163,66 @@ nio --skills remove skill-name
 
 ## Optional plugins
 
-Plugins add executable file readers without bundling their dependencies into nio. PDF is the first available plugin; other readers can use the same package interface.
+Plugins add specialized capabilities and executable file readers without bundling heavy external dependencies into the base Nio binary. Plugins run safely with bounded output.
 
-```sh
-nio --plugins                         # installed and available plugins
-nio plugins install pdf               # PDF text extraction, no OCR models
-nio --plugins install pdf --languages eng,khm
-nio --plugins install pdf --languages all
-nio --plugins languages pdf            # language codes and download sizes
-nio --plugins disable pdf
-nio --plugins enable pdf
-nio --plugins remove pdf
-nio --plugins list --format json
+### Interactive plugin manager
+
+In the interactive prompt or full-screen TUI, type **`:plugins`** to open the visual manager with **instant search filtering**, status indicators, and one-click install/remove controls:
+
+```text
+┌─ Plugins (19 available) ──────────────────────────────────────────────┐
+│  Search: data                                                         │
+├───────────────────────────────────────────────────────────────────────┤
+│  ▶ Tabular Data Profiler [data-profiler]   Profiles large CSV/TSV/JSONL│
+│    DuckDB Analytics      [duckdb]          Fast in-process SQL on data│
+│    Parquet Reader        [parquet]         Column min/max statistics  │
+├───────────────────────────────────────────────────────────────────────┤
+│  [Enter] Install/Manage  ·  [↑/↓] Navigate  ·  [Esc] Back             │
+└───────────────────────────────────────────────────────────────────────┘
 ```
 
-`nio --plugins` opens a provider-style selection menu in an interactive terminal; `nio plugins` is an alias. Choose the PDF plugin to install, enable, disable, or remove it. For OCR, mark the language packs you need and select **Install PDF plugin with selected languages** (or **Install selected OCR languages** if PDF is already installed). **Install all languages** remains an explicit option. The TUI language list also supports text search. `nio --plugins list` prints a plain list; JSON and noninteractive invocations remain scriptable. `:plugins` and `/plugins` also work in the interactive prompt and TUI. Packages, enabled settings, and OCR models are stored beside the Nio configuration. Removing a plugin also removes its downloaded models. Installations are serialized and staged before registration. Reinstalling `pdf` adds missing languages and enables the plugin; it does not remove existing models.
-
-The PDF plugin is a separate `nio-pdf` executable. The installer uses a worker alongside nio for local builds, or downloads the worker for the current platform and nio version from the official release and verifies its SHA-256 checksum. Released base nio archives do not contain the PDF worker. Plugin download installation requires a release publishing the matching worker asset; until then, build both binaries locally:
+### CLI management
 
 ```sh
-cargo build --release --locked --bin nio
-cargo build --release --locked --features pdf-plugin --bin nio-pdf
-./target/release/nio --plugins install pdf
+nio plugins list                      # Browse all installed & available plugins
+nio plugins install sqlite            # Install SQLite schema & query inspector
+nio plugins install duckdb            # Install DuckDB analytics engine
+nio plugins install ast-grep          # Install Tree-sitter structural code search
+nio plugins install pdf --languages all # Install PDF reader with OCR language packs
+nio plugins disable sqlite            # Disable a plugin
+nio plugins enable sqlite             # Re-enable an installed plugin
+nio plugins remove sqlite             # Uninstall and clean up storage
 ```
 
-PDF text extraction needs no other program. OCR is optional: install language models and provide `tesseract` and Poppler's `pdftoppm` on PATH. For example, macOS uses `brew install tesseract poppler`, and Debian/Ubuntu uses `apt install tesseract-ocr poppler-utils`; Windows users need compatible Tesseract and Poppler installations on PATH. Nio does not automatically run a system package manager. Models may run an approved setup command in Build mode when the user requests it.
+### Catalog overview
 
-Language packs come from a pinned official `tessdata_fast` revision and are verified against its Git blob checksums. Selected languages download only their models. `all` installs 126 models (about 339 MiB), including orientation/math models; it does not use all of them simultaneously for recognition. `read_file` accepts `ocr_languages`, for example `["eng", "khm"]`, to choose up to eight installed recognition languages. Without a selection, OCR uses English if installed, otherwise the first installed recognition language. `osd` is orientation data and cannot be selected as a recognition language.
+| Category | Plugin | Binary | Description |
+|---|---|---|---|
+| **Data & Databases** | `sqlite` | `nio-sqlite` | Schema inspection, table counts, and safe bounded read-only queries |
+| | `duckdb` | `nio-duckdb` | Fast in-process analytical SQL on local CSV, Parquet, and JSON files |
+| | `parquet` | `nio-parquet` | Apache Parquet schema, column min/max statistics, row sampling |
+| | `postgres-lite` | `nio-postgres`| Read-only dev PostgreSQL database schema and foreign key inspector |
+| | `redis-tool` | `nio-redis` | Inspects Redis keyspaces, key types, TTLs, and cache configurations |
+| | `data-profiler` | `nio-profiler`| Profiles large CSV/TSV/JSONL datasets: column types, null counts, stats |
+| **Code & Testing** | `ast-grep` | `nio-ast` | Structural code search using concrete syntax trees (Tree-sitter) |
+| | `linter-bridge` | `nio-linter` | Collects structured compiler/linter diagnostics (Clippy, ESLint, Ruff) |
+| | `test-reporter` | `nio-tester` | Runs project tests (cargo test, pytest, vitest) and isolates failed assertions |
+| | `benchmark-runner` | `nio-bench` | Runs micro-benchmarks (criterion/hyperfine) and detects regressions |
+| | `git-advanced` | `nio-git` | Semantic git blame, commit divergence graphing, and merge conflict helper |
+| **APIs & Web** | `http-client` | `nio-http` | Structured HTTP client to test local dev servers with timing & JSON validation |
+| | `openapi` | `nio-openapi` | Parses OpenAPI/Swagger specs, summarizes routes, validates schemas |
+| **DevOps & Cloud** | `docker-inspector`| `nio-docker` | Container status inspection, log tailing, port mappings, and compose view |
+| | `k8s-view` | `nio-k8s` | Read-only Kubernetes pod logs, deployment configs, cluster events |
+| | `env-guard` | `nio-guard` | Scans code and staged files for exposed API keys, tokens, and secrets |
+| | `terraform-check` | `nio-tf` | Validates HCL syntax and summarizes planned infrastructure changes |
+| | `pcap-inspector` | `nio-pcap` | Summarizes network packet capture files (DNS queries, TLS, HTTP) |
+| **Documents & OCR** | `pdf` | `nio-pdf` | Extracts text from PDF pages with optional Tesseract OCR language packs |
 
-The PDF reader extracts each page's existing text layer and uses OCR for pages with no extractable text. It keeps page labels and marks OCR results. Inputs are capped at 20 MiB, extracted text at 512 KiB, PDFs at 1,000 pages, and OCR at 50 pages per document. Each render/OCR process has a 60-second timeout; plugin reads have a 300-second total timeout. Split larger scans into smaller documents. Embedded images on a page that already has text are not separately OCR'd, and OCR can misread text.
+### PDF & OCR configuration
 
-Models can inspect `list_plugins` in every mode. `install_plugin` is available in Ask, Plan, and Build so file analysis can install a needed reader or OCR language packs without a mode switch. Ask and Plan always require explicit installation approval, even if automatic approval is enabled; noninteractive Ask and Plan runs deny installation. `manage_plugin` (enable/disable/remove) still requires Build mode and approval. Installation approval names the plugin, OCR selection, and estimated model download size. When a PDF is attached in an interactive session and the reader is missing, nio asks for installation approval before sending the document to the model. A filename containing “scan” suggests English OCR for this prompt. If installation is declined or OCR support is missing, the model sees the read error and can explain the next step. Reading never installs plugins or downloads languages implicitly. `--no-tools` disables model plugin management too.
-
-The current plugin catalog contains the PDF reader. The plugin system can support other readers in the future. Installed plugin code runs locally with host access, and plugin output is bounded and treated as untrusted data.
+PDF text extraction works out-of-the-box. Scanned documents use optional OCR:
+* Provide `tesseract` and Poppler's `pdftoppm` on `PATH` (e.g. `brew install tesseract poppler` on macOS or `apt install tesseract-ocr poppler-utils` on Ubuntu).
+* Language models come from pinned official `tessdata_fast` releases. Install specific languages via `nio plugins install pdf --languages eng,khm` or install all 126 language packs with `--languages all`.
 
 ## Full-screen interface
 
@@ -290,25 +317,7 @@ Toggle automatic approval for a single run with `--auto`. Set reasoning effort w
 
 ## Privacy
 
-NioAI includes no telemetry, analytics, tracking, or background reporting. Network requests only go to features you use: model discovery, provider checks, responses, requested web pages, and requested skill/plugin/language downloads. Prompts, conversation context, project files, tool results, and approved command output can be sent to the model endpoint. Review your provider's terms before sending sensitive information. Credentials and sessions are stored locally; on Unix they are restricted to your user account. Avoid putting API keys directly in shell history.
-
-## NioDE integration
-
-NioAI is available as the `nio` agent through NioDE's direct subprocess route. Install a current native `nio` executable on the server's `PATH`; Nio does not require npm or a persistent agent server. Automatic installation awaits published, verified native release artifacts.
-
-The Chat UI requests project access before enabling Nio tools. Build consent also grants file edits and shell execution for that conversation/project. Ask and Plan allow reads and approved plugin/language installation; project editing and shell execution require Build. Installed third-party plugin executables remain trusted host code. Studio and Canvas use `--mode ask --no-project-tools` with Nio 0.3.0 or later; it receives generated text and owns its file writes.
-
-For another host, the explicit interface is:
-
-```sh
-nio models --format json
-nio run -m kilo::kilo-auto/free --format json --mode ask --reasoning low \
-  --trust-project --dir /path/to/project -s project-chat -- "Explain this project"
-```
-
-`--trust-project` grants project reads for this invocation. `--no-tools` disables all project discovery and tools, even for remembered trusted folders. `--auto` grants writes and shell commands for a single invocation; noninteractive runs ignore saved automatic approval preferences. Approved commands have the current user's host access; the project directory is their starting directory, not a shell sandbox. `NIO_API_KEY` overrides credentials for the selected chat provider and is not broadcast to model catalogs. Catalogs use provider-specific saved or environment credentials. `--reasoning` accepts low, medium, high, or default. `--file PATH` attaches a supported document, UTF-8/UTF-16 text file, or a PNG, JPEG, GIF, or WebP image. In prompts, use `@path` or `@{path with spaces}` to attach an existing file; in the regular interactive prompt and `--tui`, an existing absolute path pasted or dropped into the prompt is also attached automatically. `read_file` can read a specific absolute local path when you ask about it, including image files; project-relative reads remain project-scoped. Dropping a supported file into the TUI composer inserts a path reference. Attachment excerpts share a 24 KiB prompt limit; longer files include a truncation notice and can be continued through `read_file`; image files may be up to 10 MiB each and 20 MiB total. Images require a vision-capable provider model. Built-in document reading supports Word (`.docx`, `.docm`), Excel (`.xlsx`, `.xls`, `.xlsb`, `.xlsm`, `.xlam`), PowerPoint (`.pptx`, `.pptm`), and OpenDocument (`.odt`, `.ods`, `.odp`). Markdown, plain text, JSON/JSONL, CSV/TSV, YAML, TOML, XML, HTML, logs, and source code work as text. UTF-16 text requires a byte-order mark. Documents are extracted locally into text; formatting, embedded images, charts, and macros are not analyzed or executed. Spreadsheet output includes sheet names, row numbers, and tab-separated cell values; formulas are not recalculated. Scanned PDFs need OCR or page images; password-protected documents and legacy Word `.doc`/PowerPoint `.ppt` need conversion to an unlocked supported format. Document inputs are capped at 20 MiB, extracted text at 512 KiB, and ZIP-based documents at 4,096 entries and 32 MiB of declared expanded content. Parser working memory can exceed these file limits. PDF reading and optional OCR are provided by the separately installed `pdf` plugin. Document editing is not included.
-
-JSON runs emit a `session` event with `sessionID` immediately, and persist the conversation on completion or handled interruption. Sessions are bound to the canonical project directory and project-access scope, with a lock preventing simultaneous use. Old array-only sessions have no project binding and require starting a new session; their files are preserved.
+NioAI includes no telemetry, analytics, tracking, or background reporting. Network requests only go to features you use: model discovery, provider checks, responses, requested web pages, and requested skill/plugin/language downloads. Prompts, conversation context, project files, tool results, and approved command output are sent only to the model endpoint you configure. Credentials and sessions are stored strictly on your local machine; on Unix they are restricted to your user account.
 
 ## CI/CD and automation
 
