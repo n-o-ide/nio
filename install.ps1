@@ -53,7 +53,21 @@ try {
     if ($Entries.Count -ne 1 -or $Entries[0] -notmatch '^[a-fA-F0-9]{64}$') {
         throw "Missing, invalid, or duplicate checksum for $Archive."
     }
-    $Actual = (Get-FileHash -LiteralPath $ArchiveFile -Algorithm SHA256).Hash
+    $Actual = if (Get-Command Get-FileHash -ErrorAction SilentlyContinue) {
+        (Get-FileHash -LiteralPath $ArchiveFile -Algorithm SHA256).Hash
+    } else {
+        $FileStream = [System.IO.File]::OpenRead($ArchiveFile)
+        try {
+            $Sha256 = [System.Security.Cryptography.SHA256]::Create()
+            try {
+                [System.BitConverter]::ToString($Sha256.ComputeHash($FileStream)) -replace '-'
+            } finally {
+                $Sha256.Dispose()
+            }
+        } finally {
+            $FileStream.Dispose()
+        }
+    }
     if ($Actual -ne $Entries[0]) { throw "Checksum verification failed!" }
 
     # 4. Extract
