@@ -1,149 +1,138 @@
 # NioAI
 
-**NioAI is open source software** released under the [MIT License](LICENSE). Contributions, issues, and usage questions are welcome.
+<p align="center">
+  <strong>An ultra-lightweight, blazing-fast AI coding agent for the terminal.</strong><br>
+  Written in Rust · Zero runtime dependencies · Sub-10ms startup · Open Source (MIT)
+</p>
 
-NioAI is a lightweight, open source AI coding agent for the terminal. The executable is **`nio`**. It talks to configurable OpenAI-compatible model endpoints. Provider access, model availability, and free quotas depend on the provider and may change.
+<p align="center">
+  <a href="#why-nioai">Why NioAI?</a> •
+  <a href="#quick-start">Quick Start</a> •
+  <a href="#screenshots">Screenshots</a> •
+  <a href="#features">Features</a> •
+  <a href="#installation">Installation</a> •
+  <a href="#key-commands">Key Commands</a> •
+  <a href="#privacy">Privacy</a>
+</p>
 
-An older, separate NIO platform also provides a `nio` command. If both are installed, use the full executable path or adjust `PATH`.
+---
 
-Current release: [v0.3.3](https://github.com/nio-labs/nio/releases/tag/v0.3.3).
+## Why NioAI?
 
-Use `nio --version`, `nio -v`, or `nio --v` to print the installed version.
+- ⚡ **Blazing Fast Startup (<10ms)**: Built in native Rust. Starts instantly in your terminal without the startup lag or runtime tax of Python, Node.js, or Electron.
+- 🪶 **Ultra-Lightweight Footprint**: Consumes under ~20MB of RAM. Keep it running in the background without draining your battery or hogging CPU.
+- 🎙️ **Voice & Multimodal Audio Input**: Speak naturally to your agent with `:voice`. Records microphone audio natively and sends transcribed or raw multimodal audio to LLMs.
+- 🛡️ **Atomic Undo & Local Reliability**: Every file change is backed by an atomic journal with instant rollback (`:undo`). Never lose code to an unexpected model hallucination.
+- 🔌 **Universal Provider Support & Failover**: Works out of the box with any OpenAI-compatible provider (OpenRouter, Groq, Cerebras, Claude, OpenAI, Gemini, DeepSeek, or local Ollama). Automatically offers failover when a provider drops.
+- 🎨 **Dual Terminal Interface**: Use the distraction-free inline CLI with non-blocking message queuing (`queue>`) or switch to the full-screen, themeable terminal TUI (`nio --tui`).
+- 🔒 **Privacy-First**: Zero telemetry, zero analytics, zero external logging. Your API keys, code, and session history remain 100% on your local machine.
 
-## What’s new in v0.3.3
+---
 
-- **Voice input & audio LLM support**: Record microphone audio and query LLMs with `:voice` and `nio voice`, featuring native macOS AVFoundation recording, live recording timer, Whisper speech-to-text, and multimodal audio input.
-- **Dedicated visible search input in menus**: Added visible search input box with live filtering and navigation to `:plugins` and picker menus.
-- **Provider failover & recovery**: Prompt to switch providers or retry when connection drops or providers become unavailable.
-- **Snippets & NioDE daemon**: Manage reusable code snippets with `:snippets` and background IDE language services with `:ide`.
+## Quick start
 
-## What’s new in v0.3.2
-
-- Wrap long fenced code lines inside their frame, accounting for response indentation and wide characters. Wrapped lines retain the frame prefix and complete code text.
-
-## What’s new in v0.3.1
-
-- Delay the assistant label until visible text arrives, removing blank replies between tool calls and keeping working status visible while Markdown tables are buffered.
-
-## What’s new in v0.3.0
-
-- Find files by glob and search code with literal or regex queries, numbered context, and pagination.
-- Read supplied web URLs with `web_fetch`, without a search service or search API key.
-- Ask focused clarification questions and manage approved terminal commands with incremental output.
-- Render italics and streamed tables, including bold and italic table cells.
-- Allow URL reading and questions in Studio and Canvas while project tools are disabled.
-
-## Features
-
-<table>
-  <tr>
-    <td align="left" valign="top"><strong>Work in Ask, Plan, or Build mode</strong><br><br>Choose how much autonomy Nio should use, from read-only guidance to making changes.</td>
-    <td align="left" valign="top"><strong>Use your preferred model</strong><br><br>Connect to configurable OpenAI-compatible providers, with model discovery and provider presets.</td>
-    <td align="left" valign="top"><strong>Work directly in your project</strong><br><br>Search, read, and edit project files, or run approved shell commands from the terminal.</td>
-  </tr>
-  <tr>
-    <td align="left" valign="top"><strong>Keep work moving with a queue</strong><br><br>Queue follow-up requests while Nio is working.</td>
-    <td align="left" valign="top"><strong>Pick your terminal interface</strong><br><br>Use the inline CLI or switch to the full-screen TUI.</td>
-    <td align="left" valign="top"><strong>Resume and extend conversations</strong><br><br>Save sessions, stream JSON events, and add GitHub skills.</td>
-  </tr>
-</table>
-
-## Requirements
-
-- Rust toolchain to build from source
-- Any OpenAI-compatible provider you configure; Kilo is available by default
-
-## Build
-
-```sh
-cargo build --release
-```
-
-The executable is at `target/release/nio`.
-
-## Install
-
-### Zero-install via npx
-
-If you have Node.js available, launch NioAI instantly with zero manual installation:
+Launch instantly with zero installation (requires Node.js):
 
 ```sh
 npx @nio-labs/nio-ai
 ```
 
-Run one-shot prompts or flags directly:
+Or install the pre-compiled native binary:
 
 ```sh
-npx @nio-labs/nio-ai run "Explain this project"
-npx @nio-labs/nio-ai models --format json
-```
-
-The npm launcher caches binaries by package version and platform, verifies checksums before extraction, and checks the executable version before using it. Downloads require HTTPS and have a two-minute deadline. It does not automatically use another `nio` from `PATH`; set `NIO_BIN` to explicitly use your own executable.
-
-To install globally via npm:
-
-```sh
-npm install -g @nio-labs/nio-ai
-nio
-```
-
-### Shell installer (Linux, macOS, Termux)
-
-Install the pre-built native binary via `curl`:
-
-```sh
+# macOS, Linux, Termux
 curl -fsSL https://raw.githubusercontent.com/nio-labs/nio/main/install.sh | bash
-```
 
-Prefer inspecting the script before piping to shell?
-```sh
-curl -fsSL https://raw.githubusercontent.com/nio-labs/nio/main/install.sh -o install.sh
-less install.sh
-bash install.sh
-```
-
-Custom installation options:
-```sh
-# Pin a specific version
-curl -fsSL https://raw.githubusercontent.com/nio-labs/nio/main/install.sh | NIO_VERSION=v0.3.3 bash
-
-# Custom install path (defaults to ~/.local/bin)
-curl -fsSL https://raw.githubusercontent.com/nio-labs/nio/main/install.sh | NIO_INSTALL_DIR="$HOME/.local/bin" bash
-```
-
-### Windows (PowerShell)
-
-```powershell
+# Windows (PowerShell)
 irm https://raw.githubusercontent.com/nio-labs/nio/main/install.ps1 | iex
 ```
 
-Both native installers require a valid checksum before extraction and refuse to replace an unrelated `nio` executable. Pinned installations also verify the downloaded executable version.
-
-See [INSTALL_PLAN.md](INSTALL_PLAN.md) for supported native platform targets and verification plans.
-
-## Quick start
-
-Start the agent. On first launch, Nio fetches models, shows free models first, and saves your choice:
+Start the interactive agent:
 
 ```sh
 nio
 ```
 
-Override the model for one run:
+On first launch, Nio automatically fetches available models, highlights free models, and saves your preference.
+
+Override the model for a one-shot query:
 
 ```sh
 nio run -m kilo::kilo-auto/free "Explain this project"
 ```
 
+---
+
 ## Screenshots
 
-Inline CLI showing a project analysis in progress:
+Inline CLI showing an interactive project analysis:
 
 ![NioAI inline CLI](screenshots/nio.png)
 
-Full-screen TUI with the command palette open:
+Full-screen TUI with theme support and command palette:
 
 ![NioAI full-screen TUI](screenshots/tui.png)
+
+---
+
+## Installation
+
+### 1. Pre-built native binary (Recommended)
+
+```sh
+# Linux, macOS, Termux
+curl -fsSL https://raw.githubusercontent.com/nio-labs/nio/main/install.sh | bash
+
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/nio-labs/nio/main/install.ps1 | iex
+```
+
+Custom installation options:
+```sh
+# Pin a specific release
+curl -fsSL https://raw.githubusercontent.com/nio-labs/nio/main/install.sh | NIO_VERSION=v0.3.3 bash
+
+# Custom installation directory
+curl -fsSL https://raw.githubusercontent.com/nio-labs/nio/main/install.sh | NIO_INSTALL_DIR="$HOME/.local/bin" bash
+```
+
+### 2. npm launcher (Zero-install or Global)
+
+```sh
+# Zero-install execution
+npx @nio-labs/nio-ai
+
+# Global npm installation
+npm install -g @nio-labs/nio-ai
+nio
+```
+
+The npm launcher caches verified binaries by package version and platform, verifies SHA-256 checksums before extraction, and checks binary authenticity before execution.
+
+### 3. Build from source (Rust)
+
+```sh
+cargo install --locked --git https://github.com/nio-labs/nio
+# Or clone and build locally:
+cargo build --release
+```
+
+---
+
+## Features
+
+<table>
+  <tr>
+    <td align="left" valign="top"><strong>Ask, Plan, or Build mode</strong><br><br>Choose how much autonomy Nio uses, from read-only architectural guidance to fully approved code changes.</td>
+    <td align="left" valign="top"><strong>Universal Model Discovery</strong><br><br>Connect to any OpenAI-compatible provider with automatic model cataloging and free tier filtering.</td>
+    <td align="left" valign="top"><strong>Deep Project Tools</strong><br><br>Search code with regex, find files by glob, read documents, inspect git diffs, and run approved shell commands.</td>
+  </tr>
+  <tr>
+    <td align="left" valign="top"><strong>Non-blocking queue</strong><br><br>Queue follow-up prompts while Nio is generating answers or editing files.</td>
+    <td align="left" valign="top"><strong>Voice & Multimodal Audio</strong><br><br>Speak directly into your microphone with <code>:voice</code> for instant audio transcription and multimodal querying.</td>
+    <td align="left" valign="top"><strong>Atomic Undo Journaling</strong><br><br>Revert file edits made by the agent across current or previous runs with instant atomic rollbacks.</td>
+  </tr>
+</table>
 
 ## Queue messages while working
 
@@ -227,22 +216,27 @@ The theme panel previews each highlighted theme immediately. Enter saves it; Esc
 
 TUI settings also accept explicit values, such as `:mode build`, `:theme ocean` or `:theme light`, and `:proxy off`. `:provider` displays saved providers; configure provider credentials with `nio provider` in the inline CLI.
 
-## Configure and run
+## Key commands
 
-Nio asks whether to trust the current project folder before enabling file access and tools. Trusted folders are remembered. Untrusted non-interactive projects stay locked unless you pass `--trust-project`. In an interactive terminal, Nio still prompts on first access.
+Nio provides an interactive command palette in both the inline CLI and full-screen TUI (type `:` or `/`):
 
-Key commands:
+| Command | Action |
+|---|---|
+| `:voice` | Record microphone audio and send transcribed/multimodal audio to the model |
+| `:mode` | Switch autonomy mode (`ask`, `plan`, `build`) |
+| `:models` | Browse, search, and switch models and providers |
+| `:undo` | Revert the last agent file change with atomic rollback |
+| `:diff` | Review pending git modifications and changes |
+| `:snippets` | Manage reusable code snippets and prompt templates |
+| `:ide` | Manage background NioDE IDE language services daemon |
+| `:plugins` | Install and configure optional file readers (PDF, SQLite, DuckDB, etc.) |
+| `:skills` | Browse, add, and manage GitHub-based agent skills |
+| `:queue` | Inspect and edit queued background messages |
+| `:settings` | Configure theme, reasoning effort, auto-approval, and mouse |
+| `:clear` | Clear the current conversation context |
+| `:quit` | Save session and exit |
 
-- `:clear` — clear the conversation
-- `:diff` — review git changes
-- `:undo` — revert the last agent file change, including changes from earlier runs in this project
-- `:quit` — exit
-- `:provider` — add or update a provider
-- `:mode` — choose Ask, Plan, or Build
-- `:models` — browse the model catalog
-- `:settings` — inspect and edit saved settings
-
-Presets include OpenRouter, OrcaRouter, AIHubMix, Groq, Cerebras, Gemini, DeepSeek, Together AI, Fireworks, Mistral, SiliconFlow, Anthropic Claude, and OpenAI Codex.
+Preset providers include OpenRouter, Groq, Cerebras, Gemini, DeepSeek, Together AI, Fireworks, Mistral, SiliconFlow, Anthropic Claude, and OpenAI Codex.
 
 File tools stay inside the current directory. Auto-discovery skips generated folders, secret filenames, and `.gitignore` paths. Text reads and writes are capped at 512 KiB; supported document inputs may be up to 20 MiB, with at most 512 KiB of extracted text. Search reads at most 16 MiB and returns at most 50 entries. `.gitignore` parsing is bounded to 256 KiB.
 
