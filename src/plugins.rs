@@ -46,6 +46,397 @@ pub fn languages() -> Vec<Language> {
         .expect("built-in language catalog")
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct CatalogPlugin {
+    pub name: &'static str,
+    pub display_name: &'static str,
+    pub description: &'static str,
+    pub extensions: &'static [&'static str],
+    pub tags: &'static [&'static str],
+    pub binary: &'static str,
+    pub license: &'static str,
+}
+
+pub static CATALOG: &[CatalogPlugin] = &[
+    CatalogPlugin {
+        name: "pdf",
+        display_name: "PDF",
+        description: "PDF text extraction with optional OCR language packs",
+        extensions: &["pdf"],
+        tags: &["pdf", "ocr", "text", "document"],
+        binary: "nio-pdf",
+        license: "MIT / Apache-2.0",
+    },
+    CatalogPlugin {
+        name: "sqlite",
+        display_name: "SQLite Reader & Query",
+        description: "Inspect schema, table row counts, and run bounded read-only queries",
+        extensions: &["db", "sqlite", "sqlite3"],
+        tags: &["db", "sql", "sqlite", "sqlite3", "query"],
+        binary: "nio-sqlite",
+        license: "MIT / Public Domain",
+    },
+    CatalogPlugin {
+        name: "duckdb",
+        display_name: "DuckDB Analytics",
+        description: "Fast in-process analytical SQL on local CSV, Parquet, and JSON files",
+        extensions: &["duckdb", "ddb"],
+        tags: &["duckdb", "analytics", "olap", "parquet", "sql"],
+        binary: "nio-duckdb",
+        license: "MIT",
+    },
+    CatalogPlugin {
+        name: "parquet",
+        display_name: "Parquet Reader",
+        description: "Apache Parquet schema, column min/max statistics, row sampling",
+        extensions: &["parquet"],
+        tags: &["parquet", "arrow", "data", "analytics", "schema"],
+        binary: "nio-parquet",
+        license: "Apache-2.0",
+    },
+    CatalogPlugin {
+        name: "postgres-lite",
+        display_name: "PostgreSQL Schema Inspector",
+        description: "Read-only connection to dev PostgreSQL database; inspects tables & foreign keys",
+        extensions: &["pgsql", "postgres"],
+        tags: &["postgres", "psql", "database", "sql", "query"],
+        binary: "nio-postgres",
+        license: "MIT / Apache-2.0",
+    },
+    CatalogPlugin {
+        name: "redis-tool",
+        display_name: "Redis Key Explorer",
+        description: "Inspects Redis keyspaces, key types, TTLs, and cache configurations safely",
+        extensions: &["rdb"],
+        tags: &["redis", "cache", "key-value", "ttl", "memory"],
+        binary: "nio-redis",
+        license: "MIT / BSD-3-Clause",
+    },
+    CatalogPlugin {
+        name: "data-profiler",
+        display_name: "Tabular Data Profiler",
+        description: "Profiles large CSV/TSV/JSONL datasets: column types, null counts, distributions",
+        extensions: &["csv", "tsv", "jsonl", "ndjson"],
+        tags: &["csv", "tsv", "jsonl", "statistics", "profile"],
+        binary: "nio-profiler",
+        license: "MIT / Unlicense",
+    },
+    CatalogPlugin {
+        name: "linter-bridge",
+        display_name: "Linter Bridge",
+        description: "Collects structured compiler/linter diagnostics (Clippy, ESLint, Ruff) for auto-fixing",
+        extensions: &["lint"],
+        tags: &["linter", "clippy", "eslint", "ruff", "diagnostics", "fix"],
+        binary: "nio-linter",
+        license: "MIT / Apache-2.0",
+    },
+    CatalogPlugin {
+        name: "test-reporter",
+        display_name: "Test Failure Reporter",
+        description: "Runs project tests (cargo test, pytest, vitest) and isolates failed assertions",
+        extensions: &["test"],
+        tags: &["test", "pytest", "cargo-test", "failures", "junit"],
+        binary: "nio-tester",
+        license: "MIT / Apache-2.0",
+    },
+    CatalogPlugin {
+        name: "ast-grep",
+        display_name: "AST Code Search",
+        description: "Structural code search using concrete syntax trees (Tree-sitter)",
+        extensions: &["ast"],
+        tags: &["ast", "syntax", "tree-sitter", "search", "refactor"],
+        binary: "nio-ast",
+        license: "MIT",
+    },
+    CatalogPlugin {
+        name: "http-client",
+        display_name: "REST API Client",
+        description: "Structured HTTP client to test local dev servers with timing and JSON validation",
+        extensions: &["http", "rest"],
+        tags: &["http", "curl", "api", "rest", "test", "request"],
+        binary: "nio-http",
+        license: "MIT / Apache-2.0",
+    },
+    CatalogPlugin {
+        name: "openapi",
+        display_name: "OpenAPI Validator",
+        description: "Parses OpenAPI/Swagger specs, summarizes routes, and validates payloads against schemas",
+        extensions: &["yaml", "json"],
+        tags: &["openapi", "swagger", "yaml", "api-schema", "endpoints"],
+        binary: "nio-openapi",
+        license: "MIT / Apache-2.0",
+    },
+    CatalogPlugin {
+        name: "git-advanced",
+        display_name: "Git Advanced Tools",
+        description: "Semantic git blame, commit divergence graphing, and merge conflict resolution helper",
+        extensions: &["git"],
+        tags: &["git", "blame", "diff", "branches", "merge"],
+        binary: "nio-git",
+        license: "MIT / Apache-2.0",
+    },
+    CatalogPlugin {
+        name: "benchmark-runner",
+        display_name: "Benchmark Runner",
+        description: "Runs micro-benchmarks (criterion/hyperfine) and summarizes performance regressions",
+        extensions: &["bench"],
+        tags: &["bench", "benchmark", "perf", "latency"],
+        binary: "nio-bench",
+        license: "Apache-2.0 / MIT",
+    },
+    CatalogPlugin {
+        name: "docker-inspector",
+        display_name: "Docker Inspector",
+        description: "Safe container status inspection, log tailing, port mappings, and compose view",
+        extensions: &["dockerfile"],
+        tags: &["docker", "containers", "compose", "logs", "ps"],
+        binary: "nio-docker",
+        license: "Apache-2.0",
+    },
+    CatalogPlugin {
+        name: "k8s-view",
+        display_name: "Kubernetes View",
+        description: "Read-only Kubernetes pod logs, deployment configs, cluster events, and secrets info",
+        extensions: &["k8s"],
+        tags: &["k8s", "kubernetes", "pods", "helm", "cluster"],
+        binary: "nio-k8s",
+        license: "Apache-2.0",
+    },
+    CatalogPlugin {
+        name: "env-guard",
+        display_name: "Secret & Credential Guard",
+        description: "Scans repository code and staged files for exposed API keys, tokens, and private secrets",
+        extensions: &["env"],
+        tags: &["env", "secrets", "dotenv", "security", "leak"],
+        binary: "nio-guard",
+        license: "MIT / Apache-2.0",
+    },
+    CatalogPlugin {
+        name: "terraform-check",
+        display_name: "Terraform HCL Validator",
+        description: "Validates HCL syntax and summarizes planned infrastructure resource changes",
+        extensions: &["tf", "hcl"],
+        tags: &["terraform", "hcl", "iac", "plan", "validate"],
+        binary: "nio-tf",
+        license: "MIT / Apache-2.0",
+    },
+    CatalogPlugin {
+        name: "pcap-inspector",
+        display_name: "PCAP Packet Inspector",
+        description: "Summarizes packet capture files (DNS queries, TLS handshakes, HTTP endpoints)",
+        extensions: &["pcap", "pcapng", "cap"],
+        tags: &["pcap", "network", "packet", "tcpdump", "traffic"],
+        binary: "nio-pcap",
+        license: "MIT / Apache-2.0",
+    },
+    CatalogPlugin {
+        name: "system-info",
+        display_name: "System Environment Info",
+        description: "Reports host CPU, memory pressure, architecture, and listening network ports",
+        extensions: &["sys"],
+        tags: &["os", "cpu", "memory", "disk", "ports", "hardware"],
+        binary: "nio-sys",
+        license: "MIT",
+    },
+    CatalogPlugin {
+        name: "image-ocr",
+        display_name: "Image Text OCR",
+        description: "Recognizes text from screenshots, error popups, diagrams, and scanned images",
+        extensions: &["png", "jpg", "jpeg", "webp", "tif", "tiff", "heic"],
+        tags: &["ocr", "image", "png", "jpg", "screenshot", "tesseract"],
+        binary: "nio-ocr",
+        license: "Apache-2.0",
+    },
+    CatalogPlugin {
+        name: "diagram-renderer",
+        display_name: "Diagram Validator & Preview",
+        description: "Validates Mermaid/PlantUML syntax and renders ASCII or SVG diagram previews",
+        extensions: &["mmd", "mermaid", "puml"],
+        tags: &["mermaid", "plantuml", "diagram", "ascii", "visual"],
+        binary: "nio-diagram",
+        license: "MIT",
+    },
+    CatalogPlugin {
+        name: "epub",
+        display_name: "EPUB Book Reader",
+        description: "Reads technical publications and ebooks chapter-by-chapter with table of contents",
+        extensions: &["epub"],
+        tags: &["epub", "books", "docs", "chapters"],
+        binary: "nio-epub",
+        license: "MIT",
+    },
+    CatalogPlugin {
+        name: "legacy-office",
+        display_name: "Legacy Office Reader",
+        description: "Extracts readable text from older binary Word (.doc) and PowerPoint (.ppt) documents",
+        extensions: &["doc", "ppt"],
+        tags: &["doc", "ppt", "rtf", "office", "legacy"],
+        binary: "nio-legacy-office",
+        license: "MIT",
+    },
+    CatalogPlugin {
+        name: "rtf-reader",
+        display_name: "RTF Reader",
+        description: "Decodes Rich Text Format files with Unicode character escapes",
+        extensions: &["rtf"],
+        tags: &["rtf", "formatting", "rich-text"],
+        binary: "nio-rtf",
+        license: "MIT",
+    },
+    CatalogPlugin {
+        name: "font-inspector",
+        display_name: "Font File Inspector",
+        description: "Inspects .ttf, .otf, .woff2 font tables, glyph coverage, and family metadata",
+        extensions: &["ttf", "otf", "woff", "woff2"],
+        tags: &["font", "ttf", "otf", "woff2", "typography"],
+        binary: "nio-font",
+        license: "MIT / Apache-2.0",
+    },
+    CatalogPlugin {
+        name: "archive-explorer",
+        display_name: "Archive Explorer",
+        description: "Safe directory tree inspection and bounded extraction for .zip, .tar, .7z files",
+        extensions: &["zip", "tar", "gz", "tgz", "7z", "bz2"],
+        tags: &["zip", "tar", "gzip", "7z", "archive", "extract"],
+        binary: "nio-archive",
+        license: "MIT / Apache-2.0",
+    },
+    CatalogPlugin {
+        name: "notebook-engine",
+        display_name: "Jupyter Notebook Engine",
+        description: "Strips base64 image bloat and separates code, markdown, outputs, and errors",
+        extensions: &["ipynb"],
+        tags: &["ipynb", "jupyter", "notebook", "python", "cells"],
+        binary: "nio-notebook",
+        license: "MIT / Apache-2.0",
+    },
+    CatalogPlugin {
+        name: "web-archive",
+        display_name: "Web Archive Reader",
+        description: "Decodes captured web pages, documentation snapshots, and HTTP response archives",
+        extensions: &["mhtml", "warc"],
+        tags: &["mhtml", "warc", "web", "snapshot", "offline"],
+        binary: "nio-warc",
+        license: "Apache-2.0 / MIT",
+    },
+    CatalogPlugin {
+        name: "email-reader",
+        display_name: "Email Message Reader",
+        description: "Parses .eml, .msg, .mbox headers, message bodies, thread context, and attachments",
+        extensions: &["eml", "msg", "mbox"],
+        tags: &["eml", "msg", "mbox", "email", "headers", "mail"],
+        binary: "nio-email",
+        license: "Apache-2.0",
+    },
+    CatalogPlugin {
+        name: "calendar-contacts",
+        display_name: "Calendar & Contacts Reader",
+        description: "Decodes iCalendar .ics event recurrence schedules and vCard .vcf contact cards",
+        extensions: &["ics", "vcf", "vcard"],
+        tags: &["ics", "vcf", "calendar", "contacts", "vcard"],
+        binary: "nio-calendar",
+        license: "MIT / Apache-2.0",
+    },
+    CatalogPlugin {
+        name: "geospatial",
+        display_name: "Geospatial Data Reader",
+        description: "Extracts features, coordinates, geometries, and bounds from GeoJSON, GPX, and KML",
+        extensions: &["geojson", "gpx", "kml"],
+        tags: &["geojson", "gpx", "kml", "gis", "map"],
+        binary: "nio-geo",
+        license: "MIT / Apache-2.0",
+    },
+    CatalogPlugin {
+        name: "wasm-inspector",
+        display_name: "WebAssembly Inspector",
+        description: "Inspects WebAssembly .wasm/.wat exports, imports, memory configurations, and sections",
+        extensions: &["wasm", "wat"],
+        tags: &["wasm", "wat", "webassembly", "binary"],
+        binary: "nio-wasm",
+        license: "Apache-2.0 w/ LLVM",
+    },
+    CatalogPlugin {
+        name: "log-analyzer",
+        display_name: "Log Pattern Analyzer",
+        description: "Streaming log parser: clusters recurring error patterns and graphs event timestamps",
+        extensions: &["log"],
+        tags: &["log", "logs", "syslog", "trace", "error"],
+        binary: "nio-log",
+        license: "MIT / Apache-2.0",
+    },
+    CatalogPlugin {
+        name: "audio-transcribe",
+        display_name: "Audio Transcription",
+        description: "Local speech-to-text for audio bug reports, meeting notes, and memos (whisper.cpp)",
+        extensions: &["wav", "mp3", "m4a", "flac", "ogg"],
+        tags: &["audio", "speech", "whisper", "mp3", "wav"],
+        binary: "nio-audio",
+        license: "MIT",
+    },
+    CatalogPlugin {
+        name: "protobuf-inspector",
+        display_name: "Protobuf Schema Inspector",
+        description: "Decodes .proto schemas and inspects binary .pb protobuf payload dumps",
+        extensions: &["proto", "pb"],
+        tags: &["protobuf", "proto", "pb", "grpc", "schema"],
+        binary: "nio-proto",
+        license: "Apache-2.0",
+    },
+    CatalogPlugin {
+        name: "graphql-schema",
+        display_name: "GraphQL Schema Analyzer",
+        description: "Validates .graphql SDL schemas, queries, mutations, types, and deprecations",
+        extensions: &["graphql", "gql"],
+        tags: &["graphql", "schema", "sdl", "query", "api"],
+        binary: "nio-graphql",
+        license: "MIT / Apache-2.0",
+    },
+    CatalogPlugin {
+        name: "hex-inspector",
+        display_name: "Binary Hex & Entropy Inspector",
+        description: "Binary file hex dump, magic byte detection, and Shannon entropy analysis for corrupt files",
+        extensions: &["bin", "dat", "hex"],
+        tags: &["hex", "binary", "entropy", "bytes", "debug"],
+        binary: "nio-hex",
+        license: "MIT / Apache-2.0",
+    },
+    CatalogPlugin {
+        name: "diff-visualizer",
+        display_name: "Syntactic Diff Visualizer",
+        description: "Syntactic side-by-side diff summaries between files or git revisions",
+        extensions: &["diff", "patch"],
+        tags: &["diff", "patch", "compare", "syntax"],
+        binary: "nio-diff",
+        license: "Apache-2.0",
+    },
+    CatalogPlugin {
+        name: "markdown-linter",
+        display_name: "Markdown Document Linter",
+        description: "Structural Markdown validator, frontmatter checker, and broken relative link detector",
+        extensions: &["md", "markdown"],
+        tags: &["markdown", "md", "lint", "frontmatter", "links"],
+        binary: "nio-mdlint",
+        license: "MIT",
+    },
+];
+
+pub fn search_catalog(query: &str) -> Vec<&'static CatalogPlugin> {
+    let q = query.trim().to_ascii_lowercase();
+    if q.is_empty() {
+        return CATALOG.iter().collect();
+    }
+    CATALOG
+        .iter()
+        .filter(|p| {
+            p.name.to_ascii_lowercase().contains(&q)
+                || p.display_name.to_ascii_lowercase().contains(&q)
+                || p.description.to_ascii_lowercase().contains(&q)
+                || p.extensions.iter().any(|ext| ext.contains(&q))
+                || p.tags.iter().any(|tag| tag.contains(&q))
+        })
+        .collect()
+}
+
 fn directory(base: &Path) -> PathBuf {
     base.join("plugins")
 }
@@ -169,12 +560,8 @@ pub fn menu_entries(
 ) -> Result<Vec<MenuEntry>, String> {
     let installed = list(base)?;
     if view.is_empty() {
-        let mut entries = vec![menu_entry(
-            "PDF",
-            "Not installed · PDF text and optional OCR",
-            false,
-            &["menu", "pdf"],
-        )];
+        let mut entries = Vec::new();
+        // 1. Installed plugins
         for plugin in &installed {
             let detail = format!(
                 "{} · {}",
@@ -185,7 +572,7 @@ pub fn menu_entries(
                 },
                 plugin.manifest.description
             );
-            let entry = menu_entry(
+            entries.push(menu_entry(
                 if plugin.manifest.name == "pdf" {
                     "PDF"
                 } else {
@@ -194,11 +581,22 @@ pub fn menu_entries(
                 detail,
                 plugin.enabled,
                 &["menu", &plugin.manifest.name],
-            );
-            if plugin.manifest.name == "pdf" {
-                entries[0] = entry;
-            } else {
-                entries.push(entry);
+            ));
+        }
+        // 2. Available catalog plugins
+        for cat in CATALOG {
+            if !installed.iter().any(|p| p.manifest.name == cat.name) {
+                let detail = if cat.name == "pdf" {
+                    "Not installed · PDF text and optional OCR".to_string()
+                } else {
+                    format!("Available · {}", cat.description)
+                };
+                entries.push(menu_entry(
+                    cat.display_name,
+                    detail,
+                    false,
+                    &["menu", cat.name],
+                ));
             }
         }
         return Ok(entries);
@@ -327,7 +725,22 @@ pub fn menu_entries(
             false,
             &["confirm-remove", view],
         ));
-    } else if view != "pdf" {
+    } else if let Some(cat) = CATALOG.iter().find(|p| p.name == view) {
+        if cat.name != "pdf" {
+            entries.push(menu_entry(
+                format!("Install {} plugin", cat.display_name),
+                format!("Downloads and registers {}", cat.binary),
+                false,
+                &["install", cat.name],
+            ));
+        }
+        entries.push(menu_entry(
+            "Details",
+            format!("Extensions: .{} · Tags: {}", cat.extensions.join(", ."), cat.tags.join(", ")),
+            false,
+            &["menu", ""],
+        ));
+    } else {
         return Err("plugin is not installed".into());
     }
     entries.push(menu_entry("Back", "Return to plugins", false, &["menu"]));
@@ -815,8 +1228,41 @@ pub async fn command(base: &Path, args: &[String], json_output: bool) -> Result<
             };
             json!({"message":install(base, &args[1], selection).await?})
         }
+        "search" => {
+            let query = args.get(1).map(String::as_str).unwrap_or("");
+            let matches = search_catalog(query);
+            if json_output {
+                let items: Vec<Value> = matches
+                    .iter()
+                    .map(|p| {
+                        json!({
+                            "name": p.name,
+                            "display_name": p.display_name,
+                            "description": p.description,
+                            "extensions": p.extensions,
+                            "tags": p.tags,
+                            "license": p.license,
+                        })
+                    })
+                    .collect();
+                println!("{}", json!({ "plugins": items }));
+            } else {
+                if matches.is_empty() {
+                    println!("No plugins found matching '{query}'.");
+                } else {
+                    println!("Found {} plugin(s) matching '{query}':", matches.len());
+                    for p in matches {
+                        println!("  • {:<16} - {}", p.name, p.description);
+                        if !p.extensions.is_empty() {
+                            println!("    Extensions: .{}", p.extensions.join(", ."));
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
         "enable" | "disable" | "remove" | "rm" if args.len() == 2 => json!({"message":manage(base, action, &args[1])?}),
-        _ => return Err("usage: nio --plugins [list | install pdf [--languages CODES|all|none] | languages pdf | enable NAME | disable NAME | remove NAME]".into()),
+        _ => return Err("usage: nio --plugins [list | search <query> | install pdf [--languages CODES|all|none] | languages pdf | enable NAME | disable NAME | remove NAME]".into()),
     };
     if json_output {
         println!("{value}");
@@ -942,7 +1388,7 @@ mod tests {
         let base = project.0.join("config");
         let top = menu_entries(&base, "", &[]).unwrap();
         assert_eq!(top[0].label, "PDF");
-        assert_eq!(top.len(), 1);
+        assert_eq!(top.len(), CATALOG.len());
         assert!(top[0].detail.contains("Not installed"));
         let pdf = menu_entries(&base, "pdf", &[]).unwrap();
         assert!(pdf.iter().any(|e| e.command == ["install", "pdf"]));

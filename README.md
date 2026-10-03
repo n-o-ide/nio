@@ -6,9 +6,16 @@ NioAI is a lightweight, open source AI coding agent for the terminal. The execut
 
 An older, separate NIO platform also provides a `nio` command. If both are installed, use the full executable path or adjust `PATH`.
 
-Current release: [v0.3.2](https://github.com/nio-labs/nio/releases/tag/v0.3.2).
+Current release: [v0.3.3](https://github.com/nio-labs/nio/releases/tag/v0.3.3).
 
 Use `nio --version`, `nio -v`, or `nio --v` to print the installed version.
+
+## What’s new in v0.3.3
+
+- **Voice input & audio LLM support**: Record microphone audio and query LLMs with `:voice` and `nio voice`, featuring native macOS AVFoundation recording, live recording timer, Whisper speech-to-text, and multimodal audio input.
+- **Dedicated visible search input in menus**: Added visible search input box with live filtering and navigation to `:plugins` and picker menus.
+- **Provider failover & recovery**: Prompt to switch providers or retry when connection drops or providers become unavailable.
+- **Snippets & NioDE daemon**: Manage reusable code snippets with `:snippets` and background IDE language services with `:ide`.
 
 ## What’s new in v0.3.2
 
@@ -98,7 +105,7 @@ bash install.sh
 Custom installation options:
 ```sh
 # Pin a specific version
-curl -fsSL https://raw.githubusercontent.com/nio-labs/nio/main/install.sh | NIO_VERSION=v0.3.2 bash
+curl -fsSL https://raw.githubusercontent.com/nio-labs/nio/main/install.sh | NIO_VERSION=v0.3.3 bash
 
 # Custom install path (defaults to ~/.local/bin)
 curl -fsSL https://raw.githubusercontent.com/nio-labs/nio/main/install.sh | NIO_INSTALL_DIR="$HOME/.local/bin" bash
@@ -308,6 +315,33 @@ nio run -m kilo::kilo-auto/free --format json --mode ask --reasoning low \
 `--trust-project` grants project reads for this invocation. `--no-tools` disables all project discovery and tools, even for remembered trusted folders. `--auto` grants writes and shell commands for a single invocation; noninteractive runs ignore saved automatic approval preferences. Approved commands have the current user's host access; the project directory is their starting directory, not a shell sandbox. `NIO_API_KEY` overrides credentials for the selected chat provider and is not broadcast to model catalogs. Catalogs use provider-specific saved or environment credentials. `--reasoning` accepts low, medium, high, or default. `--file PATH` attaches a supported document, UTF-8/UTF-16 text file, or a PNG, JPEG, GIF, or WebP image. In prompts, use `@path` or `@{path with spaces}` to attach an existing file; in the regular interactive prompt and `--tui`, an existing absolute path pasted or dropped into the prompt is also attached automatically. `read_file` can read a specific absolute local path when you ask about it, including image files; project-relative reads remain project-scoped. Dropping a supported file into the TUI composer inserts a path reference. Attachment excerpts share a 24 KiB prompt limit; longer files include a truncation notice and can be continued through `read_file`; image files may be up to 10 MiB each and 20 MiB total. Images require a vision-capable provider model. Built-in document reading supports Word (`.docx`, `.docm`), Excel (`.xlsx`, `.xls`, `.xlsb`, `.xlsm`, `.xlam`), PowerPoint (`.pptx`, `.pptm`), and OpenDocument (`.odt`, `.ods`, `.odp`). Markdown, plain text, JSON/JSONL, CSV/TSV, YAML, TOML, XML, HTML, logs, and source code work as text. UTF-16 text requires a byte-order mark. Documents are extracted locally into text; formatting, embedded images, charts, and macros are not analyzed or executed. Spreadsheet output includes sheet names, row numbers, and tab-separated cell values; formulas are not recalculated. Scanned PDFs need OCR or page images; password-protected documents and legacy Word `.doc`/PowerPoint `.ppt` need conversion to an unlocked supported format. Document inputs are capped at 20 MiB, extracted text at 512 KiB, and ZIP-based documents at 4,096 entries and 32 MiB of declared expanded content. Parser working memory can exceed these file limits. PDF reading and optional OCR are provided by the separately installed `pdf` plugin. Document editing is not included.
 
 JSON runs emit a `session` event with `sessionID` immediately, and persist the conversation on completion or handled interruption. Sessions are bound to the canonical project directory and project-access scope, with a lock preventing simultaneous use. Old array-only sessions have no project binding and require starting a new session; their files are preserved.
+
+## CI/CD and automation
+
+NioAI can run headlessly in CI/CD pipelines (GitHub Actions, GitLab CI, scripts) for automated code reviews, PR summaries, and task execution.
+
+### Headless execution
+
+Run prompts non-interactively using `nio run` with `--auto` and `--trust-project`:
+
+```sh
+# Run a one-shot query or task in headless mode
+nio run -m kilo::kilo-auto/free --trust-project --auto "Review recent git diff and summarize changes"
+
+# Stream structured JSON events for CI consumers
+nio run --format json --trust-project --auto "Run checks and suggest fixes"
+```
+
+### Plugin handling in automated pipelines
+
+Because plugin installation grants execution trust to host binaries, interactive Nio runs require explicit user confirmation. In automated, headless environments:
+
+1. **Pre-install plugins (Recommended):** Install required plugins in your CI build steps before invoking the agent. This ensures deterministic builds and avoids network downloads during execution:
+   ```sh
+   nio --plugins install sqlite
+   nio --plugins install pdf
+   ```
+2. **Unattended execution:** If an agent encounters a file requiring an uninstalled plugin during a headless run, the read tool returns a missing plugin error instead of blocking or hanging stdin on an approval prompt. The agent will gracefully continue with other files and tasks without crashing.
 
 ## Resource and reliability limits
 

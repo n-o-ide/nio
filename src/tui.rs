@@ -826,7 +826,7 @@ impl State {
             },
             ":reasoning" if argument.is_empty()=>self.choices("Reasoning",["default","low","medium","high"].into_iter().map(|value|(value.to_string(),format!(":reasoning {value}"))).collect()),
             ":model" | ":models" if argument.is_empty()=>self.job("models",vec!["--format".into(),"json".into()])?,
-            ":setting" | ":settings"=>self.choices("Settings",vec![(format!("Agent Mode · {}",configured_agent_mode(&self.config)),":mode".into()),("Model".into(),":model".into()),(format!("Automatic approval · {}",self.config.auto_approve_actions.unwrap_or(false)),":approval".into()),("Reasoning".into(),":reasoning".into()),("Theme".into(),":theme".into()),("Skills".into(),":skills".into()),("Plugins".into(),":plugins".into()),("Proxy".into(),":proxy".into())]),
+            ":setting" | ":settings"=>self.choices("Settings",vec![(format!("Agent Mode · {}",configured_agent_mode(&self.config)),":mode".into()),("Model".into(),":model".into()),(format!("Automatic approval · {}",self.config.auto_approve_actions.unwrap_or(false)),":approval".into()),("Reasoning".into(),":reasoning".into()),("Theme".into(),":theme".into()),("Skills".into(),":skills".into()),("Plugins".into(),":plugins".into()),("Snippets".into(),":snippets".into()),("IDE".into(),":ide".into()),("Proxy".into(),":proxy".into())]),
             ":proxy" if argument.is_empty()=>{ self.input=":proxy ".into();self.cursor=self.input.chars().count();self.notice="Enter a proxy URL, or :proxy off".into(); },
             ":proxy"=>{self.config.proxy_url=if argument=="off"{None}else{let _=reqwest::Proxy::all(argument).map_err(|e|format!("invalid proxy: {e}"))?;Some(argument.into())};save_user_config(&self.config)?;self.notice="Proxy updated for subsequent requests".into();},
             ":provider"=>{self.choices("Saved providers",self.config.providers.iter().map(|provider|(format!("{} · {}",provider.name,safe_proxy_label(&provider.base_url)),format!(":provider-info {}",provider.id))).collect());},
@@ -898,6 +898,12 @@ impl State {
                 } else {
                     self.job("skills",argument.split_whitespace().map(str::to_string).collect())?;
                 }
+            }
+            ":snippets" => {
+                self.job("snippets", argument.split_whitespace().map(str::to_string).collect())?;
+            }
+            ":ide" => {
+                self.job("ide", argument.split_whitespace().map(str::to_string).collect())?;
             }
             ":continue" => { let prompt="Continue the unfinished task using the saved history and current files.".to_string(); if self.busy {enqueue_message(prompt)?;} else {self.start(options,prompt)?;} }
             _ => return Err("Use :help. TUI settings accept values: :mode build, :model SELECTOR, :theme ocean, :reasoning high.".into()),

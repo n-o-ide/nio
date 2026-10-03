@@ -1,11 +1,14 @@
 mod documents;
 mod extra_tools;
+mod ide;
 mod inline_queue;
 mod plugin_process;
 mod plugins;
 mod reliability;
 mod skills;
+mod snippets;
 mod tui;
+mod voice;
 use base64::Engine as _;
 use crossterm::cursor::{MoveDown, MoveTo, MoveToColumn, MoveToNextLine, MoveUp, position};
 use crossterm::event::{
@@ -30,6 +33,8 @@ use std::sync::{Mutex, OnceLock, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 const KILO_BASE_URL: &str = "https://api.kilo.ai/api/gateway";
 const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
@@ -234,6 +239,34 @@ fn error_code(message: &str) -> &'static str {
     } else {
         "internal"
     }
+}
+
+fn is_provider_unreachable_error(error: &str) -> bool {
+    let cat = error_code(error);
+    if cat == "provider_unavailable" || cat == "network" || cat == "timeout" {
+        return true;
+    }
+    let lower = error.to_ascii_lowercase();
+    lower.contains("temporarily unavailable")
+        || lower.contains("connect error")
+        || lower.contains("connection error")
+        || lower.contains("connection refused")
+        || lower.contains("connection reset")
+        || lower.contains("error sending request")
+        || lower.contains("dns error")
+        || lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("http 500")
+        || lower.contains("http 502")
+        || lower.contains("http 503")
+        || lower.contains("http 504")
+        || lower.contains("service unavailable")
+        || lower.contains("bad gateway")
+        || lower.contains("gateway timeout")
+        || lower.contains("provider is temporarily unavailable")
+        || lower.contains("provider_unavailable")
+        || lower.contains("failed to lookup address information")
+        || lower.contains("no route to host")
 }
 
 #[derive(Deserialize)]
@@ -853,7 +886,7 @@ async fn run() -> Result<(), CliError> {
     .map_err(|e| format!("setting interruption handler: {e}"))?;
     let mut options = parse_args(env::args().skip(1).collect()).map_err(CliError::usage)?;
     let json_run = options.json_output && options.command == "run";
-    let trust_outcome = if matches!(options.command.as_str(), "interactive" | "tui" | "run") {
+    let trust_outcome = if matches!(options.command.as_str(), "interactive" | "tui" | "run" | "voice") {
         confirm_project_trust(&options).map_err(CliError::from)
     } else {
         Ok(options.project_trusted)
@@ -887,6 +920,12 @@ async fn run() -> Result<(), CliError> {
                         .map_err(CliError::from),
                     Err(e) => Err(CliError::from(e)),
                 },
+                "snippets" => {
+                    let root = session_root(&options).unwrap_or_else(|_| PathBuf::from("."));
+                    snippets::command(&root, &options.prompt).map_err(CliError::from)
+                }
+                "ide" => ide::command(&options.prompt).await.map_err(CliError::from),
+                "voice" => voice_command(options).await.map_err(CliError::from),
                 "config" => config_command(&options),
                 "doctor" => doctor_command(&options).await,
                 "completions" => completions_command(&options),
@@ -970,6 +1009,9 @@ const SUBCOMMANDS: &[&str] = &[
     "sessions",
     "skills",
     "plugins",
+    "snippets",
+    "ide",
+    "voice",
     "config",
     "doctor",
     "completions",
@@ -1081,9 +1123,16 @@ fn parse_args(args: Vec<String>) -> Result<Options, String> {
         Some("sessions") => "sessions".to_string(),
         Some("skills") => "skills".to_string(),
         Some("plugins") => "plugins".to_string(),
+        Some("snippets") => "snippets".to_string(),
+        Some("ide") => "ide".to_string(),
+        Some("voice") => "voice".to_string(),
         Some("config") => "config".to_string(),
         Some("doctor") => "doctor".to_string(),
         Some("completions") => "completions".to_string(),
+        Some("--voice") => {
+            keep_first = true;
+            "voice".to_string()
+        }
         Some("--plugins") => {
             keep_first = true;
             "plugins".to_string()
@@ -1091,6 +1140,14 @@ fn parse_args(args: Vec<String>) -> Result<Options, String> {
         Some("--skills") => {
             keep_first = true;
             "skills".to_string()
+        }
+        Some("--snippets") => {
+            keep_first = true;
+            "snippets".to_string()
+        }
+        Some("--ide") => {
+            keep_first = true;
+            "ide".to_string()
         }
         Some("--tui") => {
             keep_first = true;
@@ -1166,6 +1223,13 @@ fn parse_args(args: Vec<String>) -> Result<Options, String> {
                     return Err("--skills is for skill management".into());
                 }
                 command = "skills".into();
+            }
+            "--voice" => {
+                reject_flag_value(name, inline)?;
+                if !matches!(command.as_str(), "voice" | "interactive" | "run") {
+                    return Err("--voice is for voice input".into());
+                }
+                command = "voice".into();
             }
             "--tui" => {
                 reject_flag_value(name, inline)?;
@@ -1386,7 +1450,9 @@ fn agent_tools(mode: &str) -> Value {
         {"type":"function","function":{"name":"write_file","description":"Create or replace a project file. Approval depends on Nio settings.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"],"additionalProperties":false}}},
         {"type":"function","function":{"name":"git_status","description":"Get current git status (modified, untracked, staged files). Available in all modes.","parameters":{"type":"object","properties":{},"additionalProperties":false}}},
         {"type":"function","function":{"name":"git_diff","description":"Get current git diff for the working tree or a specific path. Available in all modes.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Optional file path to diff"}},"additionalProperties":false}}},
-        {"type":"function","function":{"name":"run_command","description":"Run a shell command in the project. Approval depends on Nio settings.","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"],"additionalProperties":false}}}
+        {"type":"function","function":{"name":"run_command","description":"Run a shell command in the project. Approval depends on Nio settings.","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"],"additionalProperties":false}}},
+        {"type":"function","function":{"name":"search_snippets","description":"Search available custom snippets and scripts in .nio/snippets/ and ~/.nio/snippets/.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Search query for snippet name, description, tags, or contents"}},"required":["query"],"additionalProperties":false}}},
+        {"type":"function","function":{"name":"run_snippet","description":"Execute a custom snippet or script by name with optional arguments. Build mode only.","parameters":{"type":"object","properties":{"name":{"type":"string","description":"Snippet name (e.g. migrate, bench, seed)"},"args":{"type":"array","items":{"type":"string"},"description":"Arguments to pass to the snippet"}},"required":["name"],"additionalProperties":false}}}
     ]);
     let Some(tools) = tools.as_array() else {
         return json!([]);
@@ -1403,6 +1469,7 @@ fn agent_tools(mode: &str) -> Value {
                         && tool["function"]["name"] != "terminal_read"
                         && tool["function"]["name"] != "terminal_cancel"
                         && tool["function"]["name"] != "manage_plugin"
+                        && tool["function"]["name"] != "run_snippet"
             })
             .cloned()
             .collect(),
@@ -1645,6 +1712,7 @@ mod mode_tests {
                             | "terminal_read"
                             | "terminal_cancel"
                             | "manage_plugin"
+                            | "run_snippet"
                     )
                 )
             }));
@@ -2180,6 +2248,24 @@ fn render_markdown_table(lines: &[String], terminal_width: usize) -> String {
         for cell in row {
             *cell = render_inline_markdown(cell);
         }
+    }
+    // Font shaping can change a Unicode string's actual terminal width. Keep
+    // every value visible without relying on column alignment in those tables.
+    if lines.iter().any(|line| !line.is_ascii()) {
+        if rows.len() == 1 {
+            return format!("{}\n", rows[0].join(" · "));
+        }
+        let mut output = String::new();
+        for row in rows.iter().skip(1) {
+            for (index, header) in rows[0].iter().enumerate() {
+                output.push_str(if index == 0 { "• " } else { "  " });
+                output.push_str(header);
+                output.push_str(": ");
+                output.push_str(row.get(index).map(String::as_str).unwrap_or(""));
+                output.push('\n');
+            }
+        }
+        return output;
     }
     let mut widths = vec![1usize; columns];
     for row in &rows {
@@ -3254,6 +3340,8 @@ fn tool_hint(name: &str, args: &Value) -> String {
         }
         "git_status" => "",
         "git_diff" => args.get("path").and_then(Value::as_str).unwrap_or(""),
+        "search_snippets" => args.get("query").and_then(Value::as_str).unwrap_or(""),
+        "run_snippet" => args.get("name").and_then(Value::as_str).unwrap_or(""),
         _ => "",
     }
     .to_string()
@@ -3974,6 +4062,42 @@ async fn execute_agent_tool(
                 12_000,
             ))
         }
+        "search_snippets" => {
+            let query = required_arg(args, "query")?;
+            let results = snippets::search(root, query);
+            if results.is_empty() {
+                Ok(format!("No snippets found matching '{query}'."))
+            } else {
+                let mut out = format!("Found {} snippet(s):\n", results.len());
+                for s in results {
+                    let scope = if s.is_project { "project" } else { "global" };
+                    let desc = if s.description.is_empty() { "No description" } else { &s.description };
+                    out.push_str(&format!("- **{}** ({scope}): {}\n", s.name, desc));
+                    if let Some(r) = &s.runner {
+                        out.push_str(&format!("  runner: {r}\n"));
+                    }
+                    if !s.tags.is_empty() {
+                        out.push_str(&format!("  tags: {}\n", s.tags.join(", ")));
+                    }
+                }
+                Ok(out)
+            }
+        }
+        "run_snippet" => {
+            let name = required_arg(args, "name")?;
+            let snippet_args: Vec<String> = args
+                .get("args")
+                .and_then(Value::as_array)
+                .map(|arr| arr.iter().filter_map(Value::as_str).map(String::from).collect())
+                .unwrap_or_default();
+            let action = format!("Run snippet: {name} {}", snippet_args.join(" "));
+            if !interrupt.with_terminal_input(|| {
+                confirm_tool(auto_approve, action.trim(), None)
+            })? {
+                return Err("user denied snippet execution".into());
+            }
+            snippets::run(root, name, &snippet_args)
+        }
         other => Err(format!("unknown tool '{other}'")),
     }
 }
@@ -4557,7 +4681,9 @@ async fn run_agent_turn_inner(
     messages.extend(history.iter().cloned());
     let (mut prompt, referenced_attachments) = extract_attachment_references(prompt, &root)?;
     let mut image_attachments = Vec::<(String, String, String)>::new();
+    let mut audio_attachments = Vec::<(String, String, String, String)>::new();
     let mut image_bytes_total = 0usize;
+    let mut audio_bytes_total = 0usize;
     if prompt.trim().is_empty()
         && (!options.attachments.is_empty() || !referenced_attachments.is_empty())
     {
@@ -4617,8 +4743,11 @@ async fn run_agent_turn_inner(
     }
     for (attachment_index, path) in attachment_paths.iter().enumerate() {
         let image_mime = supported_image_mime(path);
+        let audio_mime = voice::supported_audio_mime(path);
         let data = if image_mime.is_some() {
             read_bounded(path, IMAGE_ATTACHMENT_LIMIT)?
+        } else if audio_mime.is_some() {
+            read_bounded(path, 25 * 1024 * 1024)?
         } else {
             Vec::new()
         };
@@ -4638,6 +4767,38 @@ async fn run_agent_turn_inner(
                     .to_string_lossy()
                     .into_owned(),
                 mime.to_string(),
+                encoded,
+            ));
+            continue;
+        }
+        if let Some(mime) = audio_mime {
+            audio_bytes_total = audio_bytes_total.saturating_add(data.len());
+            if audio_attachments.len() >= 4 {
+                return Err("a request can include at most 4 audio attachments".into());
+            }
+            if audio_bytes_total > 25 * 1024 * 1024 {
+                return Err("audio attachments exceed the combined 25 MiB limit".into());
+            }
+            let encoded = base64::engine::general_purpose::STANDARD.encode(data);
+            let format = match path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+                .as_deref()
+            {
+                Some("wav") => "wav",
+                Some("mp3") => "mp3",
+                Some("ogg") => "ogg",
+                Some("flac") => "flac",
+                _ => "wav",
+            };
+            audio_attachments.push((
+                path.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+                mime.to_string(),
+                format.to_string(),
                 encoded,
             ));
             continue;
@@ -4721,8 +4882,15 @@ async fn run_agent_turn_inner(
             "image_url":{"url":format!("data:{mime};base64,{encoded}"),"detail":"auto"}
         }));
     }
+    for (name, _mime, format, encoded) in &audio_attachments {
+        history_prompt.push_str(&format!("\n[Audio attached: {name}]"));
+        request_content.push(json!({
+            "type":"input_audio",
+            "input_audio":{"data": encoded, "format": format}
+        }));
+    }
     let history_user_message = json!({"role":"user", "content":history_prompt});
-    let request_user_message = if image_attachments.is_empty() {
+    let request_user_message = if image_attachments.is_empty() && audio_attachments.is_empty() {
         history_user_message.clone()
     } else {
         json!({"role":"user", "content":request_content})
@@ -4768,7 +4936,7 @@ async fn run_agent_turn_inner(
             )
             .await;
             if compact_result.is_ok()
-                && !image_attachments.is_empty()
+                && (!image_attachments.is_empty() || !audio_attachments.is_empty())
                 && let Some(user_message) = messages.iter_mut().rev().find(|message| {
                     message["role"] == "user"
                         && message["content"].as_str() == Some(history_prompt.as_str())
@@ -4872,9 +5040,16 @@ async fn run_agent_turn_inner(
                 String::from_utf8_lossy(&read_http_body(response, 32 * 1024).await?).into_owned();
             spinner.stop();
             let error = format_provider_error(status.as_u16(), &body, gateway);
-            if !image_attachments.is_empty() && matches!(status.as_u16(), 400 | 415 | 422) {
+            if (!image_attachments.is_empty() || !audio_attachments.is_empty())
+                && matches!(status.as_u16(), 400 | 415 | 422)
+            {
+                let media_type = if !audio_attachments.is_empty() {
+                    "audio or multimodal input"
+                } else {
+                    "image input"
+                };
                 return Err(format!(
-                    "{error}. This provider or model may not accept image input; choose a vision-capable model."
+                    "{error}. This provider or model may not accept {media_type}; choose a multimodal model."
                 ));
             }
             return Err(error);
@@ -5069,6 +5244,7 @@ async fn run_agent_turn_inner(
                     | "terminal_cancel"
                     | "install_plugin"
                     | "manage_plugin"
+                    | "run_snippet"
             );
             let status = if is_mutating { "working" } else { "exploring" };
             if options.json_output {
@@ -5697,7 +5873,7 @@ fn git_branch_cached(root: &Path) -> String {
     branch
 }
 
-async fn interactive(options: Options) -> Result<(), String> {
+async fn interactive(mut options: Options) -> Result<(), String> {
     let mut session_id = options
         .session_id
         .clone()
@@ -5742,7 +5918,7 @@ async fn interactive(options: Options) -> Result<(), String> {
 
     let mut visible_followups = Vec::<String>::new();
     let mut command_mode = false;
-    loop {
+    'interactive_loop: loop {
         if CTRL_C_COUNT.load(Ordering::SeqCst) >= 2 {
             break;
         }
@@ -5823,6 +5999,72 @@ async fn interactive(options: Options) -> Result<(), String> {
             }
             continue;
         }
+        if !command_mode && (input == ":snippets" || input.starts_with(":snippets ")) {
+            let args = input
+                .split_whitespace()
+                .skip(1)
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            if let Err(error) = snippets::command(&root, &args) {
+                eprintln!("nio: {error}");
+            }
+            continue;
+        }
+        if !command_mode && (input == ":ide" || input.starts_with(":ide ")) {
+            let args = input
+                .split_whitespace()
+                .skip(1)
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            if let Err(error) = ide::command(&args).await {
+                eprintln!("nio: {error}");
+            }
+            continue;
+        }
+        let mut voice_prompt_holder = None;
+        if !command_mode && (input == ":voice" || input.starts_with(":voice ")) {
+            match voice::record_voice_interactive() {
+                Ok(Some(wav_path)) => {
+                    let client = reqwest::Client::builder()
+                        .timeout(Duration::from_secs(60))
+                        .build()
+                        .map_err(|e| format!("building client: {e}"))?;
+                    print!("Transcribing voice input... ");
+                    let _ = io::stdout().flush();
+                    let transcript = voice::transcribe_audio(
+                        &client,
+                        &options.base_url,
+                        options.api_key.as_deref(),
+                        &wav_path,
+                    )
+                    .await;
+                    let prompt_text = match transcript {
+                        Ok(text) => {
+                            println!("\r\x1b[2K🎙️ Voice input: \"{text}\"\n");
+                            text
+                        }
+                        Err(err) => {
+                            println!(
+                                "\r\x1b[2K🎙️ Audio recorded: {} (multimodal audio attachment: {err})",
+                                wav_path.display()
+                            );
+                            options.attachments.push(wav_path);
+                            "Please listen to the attached audio recording and respond.".to_string()
+                        }
+                    };
+                    voice_prompt_holder = Some(prompt_text);
+                }
+                Ok(None) => {
+                    println!("Voice recording cancelled.");
+                    continue;
+                }
+                Err(err) => {
+                    eprintln!("nio voice: {err}");
+                    continue;
+                }
+            }
+        }
+        let input = voice_prompt_holder.as_deref().unwrap_or(input);
         if !command_mode && input == ":stop" {
             println!("No response is running. Use :queue pause to pause pending messages.");
             continue;
@@ -5941,7 +6183,8 @@ async fn interactive(options: Options) -> Result<(), String> {
         }
         if !command_mode && input == ":model" {
             if let Some(selected) = select_and_save_model(&options).await? {
-                model = selected;
+                model = selected.clone();
+                options.model = Some(selected);
                 println!("Switched to model {model}");
             } else {
                 println!("Model unchanged.");
@@ -5968,6 +6211,13 @@ async fn interactive(options: Options) -> Result<(), String> {
         }
         if !command_mode && input == ":provider" {
             configure_provider().await?;
+            if let Ok(Some(new_model)) = select_and_save_model(&options).await {
+                model = new_model.clone();
+                options.model = Some(new_model);
+            } else if let Ok(new_model) = chosen_model(&options).await {
+                model = new_model.clone();
+                options.model = Some(new_model);
+            }
             continue;
         }
         if !command_mode && input == ":proxy" {
@@ -6044,30 +6294,91 @@ async fn interactive(options: Options) -> Result<(), String> {
         } else {
             input
         };
-        let outcome = if io::stdin().is_terminal() && io::stdout().is_terminal() {
-            inline_queue::run(&options, &model, prompt, &mut history).await
-        } else {
-            run_agent_turn(&options, &model, prompt, &mut history).await
-        };
-        save_session_history(Some(&session_id), &root, &history, options.project_trusted)?;
-        match outcome {
-            Ok(suggestions) => {
-                visible_followups = suggestions;
-            }
-            Err(error) if error == TURN_INTERRUPTED => {
-                if CTRL_C_COUNT.load(Ordering::SeqCst) >= 2 {
+        let snapshot_history = history.clone();
+        loop {
+            let outcome = if io::stdin().is_terminal() && io::stdout().is_terminal() {
+                inline_queue::run(&options, &model, prompt, &mut history).await
+            } else {
+                run_agent_turn(&options, &model, prompt, &mut history).await
+            };
+            save_session_history(Some(&session_id), &root, &history, options.project_trusted)?;
+            match outcome {
+                Ok(suggestions) => {
+                    visible_followups = suggestions;
                     break;
                 }
-                QUEUE_PAUSED.store(true, Ordering::SeqCst);
-                println!(
-                    "\nInterrupted. Pending messages are preserved; :queue resume continues them."
-                );
-            }
-            Err(error) => {
-                QUEUE_PAUSED.store(true, Ordering::SeqCst);
-                eprintln!(
-                    "nio: {error}. Queue paused; use :queue resume after resolving the error."
-                );
+                Err(error) if error == TURN_INTERRUPTED => {
+                    if CTRL_C_COUNT.load(Ordering::SeqCst) >= 2 {
+                        break 'interactive_loop;
+                    }
+                    QUEUE_PAUSED.store(true, Ordering::SeqCst);
+                    println!(
+                        "\nInterrupted. Pending messages are preserved; :queue resume continues them."
+                    );
+                    break;
+                }
+                Err(error) if is_provider_unreachable_error(&error) => {
+                    eprintln!("\n⚠️  Provider is unreachable or temporarily unavailable: {error}\n");
+                    if io::stdin().is_terminal() && io::stdout().is_terminal() {
+                        let fallback_choices = [
+                            (
+                                "Select a provider (:provider)",
+                                "Switch to an alternative LLM provider",
+                                true,
+                            ),
+                            (
+                                "Retry connection",
+                                "Try sending the request again with the current provider",
+                                false,
+                            ),
+                        ];
+                        match select_menu_option_b("Provider Unavailable", &fallback_choices, 0) {
+                            Ok(Some(0)) => {
+                                history = snapshot_history.clone();
+                                if let Err(err) = configure_provider().await {
+                                    eprintln!("nio: {err}");
+                                } else {
+                                    if let Ok(Some(new_model)) =
+                                        select_and_save_model(&options).await
+                                    {
+                                        model = new_model.clone();
+                                        options.model = Some(new_model);
+                                    } else if let Ok(new_model) = chosen_model(&options).await {
+                                        model = new_model.clone();
+                                        options.model = Some(new_model);
+                                    }
+                                    println!("Using model {model}. Retrying request...");
+                                }
+                                continue;
+                            }
+                            Ok(Some(1)) => {
+                                history = snapshot_history.clone();
+                                println!("Retrying connection...");
+                                continue;
+                            }
+                            _ => {
+                                QUEUE_PAUSED.store(true, Ordering::SeqCst);
+                                eprintln!(
+                                    "Request cancelled. Queue paused; use :queue resume to continue."
+                                );
+                                break;
+                            }
+                        }
+                    } else {
+                        QUEUE_PAUSED.store(true, Ordering::SeqCst);
+                        eprintln!(
+                            "nio: {error}. Queue paused; use :queue resume after resolving the error."
+                        );
+                        break;
+                    }
+                }
+                Err(error) => {
+                    QUEUE_PAUSED.store(true, Ordering::SeqCst);
+                    eprintln!(
+                        "nio: {error}. Queue paused; use :queue resume after resolving the error."
+                    );
+                    break;
+                }
             }
         }
     }
@@ -6452,7 +6763,7 @@ fn print_prompt_divider() -> Result<(), String> {
         .map_err(|error| format!("writing prompt divider: {error}"))
 }
 
-const COMMANDS: [(&str, &str); 24] = [
+const COMMANDS: [(&str, &str); 27] = [
     (
         ":approval",
         "Toggle automatic approval for writes and commands",
@@ -6464,6 +6775,7 @@ const COMMANDS: [(&str, &str); 24] = [
     (":diff", "Show git diff of project changes"),
     (":help", "Show available commands"),
     (":history", "Switch to a saved conversation"),
+    (":ide", "Manage NioDE server daemon"),
     (":mode", "Choose Ask, Plan, or Build mode"),
     (":model", "Switch model"),
     (
@@ -6487,11 +6799,16 @@ const COMMANDS: [(&str, &str); 24] = [
     ),
     (":skills", "List/add/remove/enable/disable GitHub skills"),
     (
+        ":snippets",
+        "Manage and run custom snippets and functions",
+    ),
+    (
         ":stop",
         "Stop the current response; preserve queued messages",
     ),
     (":theme", "Choose the terminal color theme"),
     (":undo", "Revert last file change made by Nio"),
+    (":voice", "Record audio and send voice input to LLM"),
 ];
 
 enum PromptInput {
@@ -7203,33 +7520,11 @@ fn strip_terminal_ansi(text: &str) -> String {
 }
 
 fn terminal_char_width(ch: char) -> usize {
-    let code = ch as u32;
-    if ch == '\0' || ch.is_control() || matches!(code, 0x0300..=0x036F | 0xFE00..=0xFE0F | 0x200D) {
-        0
-    } else if matches!(
-        code,
-        0x1100..=0x115F
-            | 0x2329..=0x232A
-            | 0x2E80..=0xA4CF
-            | 0xAC00..=0xD7A3
-            | 0xF900..=0xFAFF
-            | 0xFE10..=0xFE6F
-            | 0xFF00..=0xFF60
-            | 0xFFE0..=0xFFE6
-            | 0x1F000..=0x1FAFF
-            | 0x20000..=0x3FFFD
-    ) {
-        2
-    } else {
-        1
-    }
+    unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0)
 }
 
 fn terminal_text_width(text: &str) -> usize {
-    strip_terminal_ansi(text)
-        .chars()
-        .map(terminal_char_width)
-        .sum()
+    UnicodeWidthStr::width(strip_terminal_ansi(text).as_str())
 }
 
 // Fit styled text to terminal cells, including the ellipsis in the budget.
@@ -7242,9 +7537,26 @@ fn clip_terminal_text(text: &str, width: usize) -> String {
     let limit = width.saturating_sub(usize::from(shortened));
     let mut output = String::new();
     let mut used = 0;
+    let mut visible = String::new();
+    let append_visible = |visible: &mut String, output: &mut String, used: &mut usize| {
+        for grapheme in UnicodeSegmentation::graphemes(visible.as_str(), true) {
+            let cells = UnicodeWidthStr::width(grapheme);
+            if *used + cells > limit {
+                visible.clear();
+                return false;
+            }
+            output.push_str(grapheme);
+            *used += cells;
+        }
+        visible.clear();
+        true
+    };
     let mut chars = text.chars().peekable();
     while let Some(character) = chars.next() {
         if character == '\x1b' {
+            if !append_visible(&mut visible, &mut output, &mut used) {
+                break;
+            }
             if chars.next() == Some('[') {
                 let mut sequence = String::from("\x1b[");
                 for code in chars.by_ref() {
@@ -7262,13 +7574,9 @@ fn clip_terminal_text(text: &str, width: usize) -> String {
         if character.is_control() {
             continue;
         }
-        let cells = terminal_char_width(character);
-        if used + cells > limit {
-            break;
-        }
-        output.push(character);
-        used += cells;
+        visible.push(character);
     }
+    append_visible(&mut visible, &mut output, &mut used);
     if shortened {
         output.push('…');
     }
@@ -7285,10 +7593,24 @@ fn render_inline_menu(
     height: usize,
     max_width: usize,
 ) -> String {
+    render_inline_menu_with_search(title, None, rows, selected, hint, width, height, max_width)
+}
+
+fn render_inline_menu_with_search(
+    title: &str,
+    search_query: Option<&str>,
+    rows: &[String],
+    selected: usize,
+    hint: &str,
+    width: usize,
+    height: usize,
+    max_width: usize,
+) -> String {
     // Leave the last terminal column unused to avoid terminal auto-wrap.
     let box_width = width.saturating_sub(1).min(max_width).max(2);
     let inner = box_width - 2;
-    let capacity = height.saturating_sub(3).max(1);
+    let extra_rows = if search_query.is_some() { 2 } else { 0 };
+    let capacity = height.saturating_sub(3 + extra_rows).max(1);
     let start = selected
         .saturating_sub(capacity / 2)
         .min(rows.len().saturating_sub(capacity));
@@ -7303,6 +7625,25 @@ fn render_inline_menu(
         "\x1b[38;5;244m╭{title}\x1b[38;5;244m{}╮\x1b[0m\r\n",
         "─".repeat(inner.saturating_sub(terminal_text_width(&title)))
     );
+
+    if let Some(query) = search_query {
+        let search_prompt = " Search: ";
+        let query_text = if query.is_empty() {
+            format!("{search_prompt}\x1b[38;5;244m(type to search)\x1b[0m")
+        } else {
+            format!("{search_prompt}\x1b[1;36m{query}\x1b[0m\x1b[7m \x1b[0m")
+        };
+        let clipped_search = clip_terminal_text(&query_text, inner);
+        output.push_str(&format!(
+            "\x1b[38;5;244m│\x1b[0m{clipped_search}{}\x1b[38;5;244m│\x1b[0m\r\n",
+            " ".repeat(inner.saturating_sub(terminal_text_width(&clipped_search)))
+        ));
+        output.push_str(&format!(
+            "\x1b[38;5;244m├{}┤\x1b[0m\r\n",
+            "─".repeat(inner)
+        ));
+    }
+
     for row in &rows[start..end] {
         let row = clip_terminal_text(row, inner);
         output.push_str(&format!(
@@ -7346,10 +7687,23 @@ impl InlineMenuFrame {
         selected: usize,
         hint: &str,
     ) -> Result<(), String> {
+        self.draw_with_search(stdout, title, None, rows, selected, hint)
+    }
+
+    fn draw_with_search(
+        &mut self,
+        stdout: &mut io::Stdout,
+        title: &str,
+        search_query: Option<&str>,
+        rows: &[String],
+        selected: usize,
+        hint: &str,
+    ) -> Result<(), String> {
         self.clear(stdout)?;
         let (width, height) = terminal::size().unwrap_or((80, 24));
-        let rendered = render_inline_menu(
+        let rendered = render_inline_menu_with_search(
             title,
+            search_query,
             rows,
             selected,
             hint,
@@ -8675,19 +9029,42 @@ fn select_menu_option_b(
     let mut guard = RawModeGuard::acquire()?;
     let mut stdout = io::stdout();
     let mut selected = initial_selected.min(items.len().saturating_sub(1));
+    let mut search_query = String::new();
     let mut frame = InlineMenuFrame::default();
-    let mut draw = |stdout: &mut io::Stdout, selected: usize, _first: bool| -> Result<(), String> {
-        let name_width = items
+
+    let get_matching_indices = |query: &str| -> Vec<usize> {
+        let q = query.trim().to_ascii_lowercase();
+        if q.is_empty() {
+            (0..items.len()).collect()
+        } else {
+            let terms = q.split_whitespace().collect::<Vec<_>>();
+            items
+                .iter()
+                .enumerate()
+                .filter(|(_, (name, desc, _))| {
+                    let n = name.to_ascii_lowercase();
+                    let d = desc.to_ascii_lowercase();
+                    terms.iter().all(|term| n.contains(term) || d.contains(term))
+                })
+                .map(|(idx, _)| idx)
+                .collect()
+        }
+    };
+
+    let mut draw = |stdout: &mut io::Stdout, selected: usize, search_query: &str, _first: bool| -> Result<(), String> {
+        let matching = get_matching_indices(search_query);
+        let name_width = matching
             .iter()
-            .map(|(name, _, _)| terminal_text_width(name))
+            .map(|&idx| terminal_text_width(items[idx].0))
             .max()
             .unwrap_or(7)
             .min(25);
-        let rows = items
+        let mut rows = matching
             .iter()
             .enumerate()
-            .map(|(index, (name, desc, active))| {
-                let pointer = if index == selected {
+            .map(|(display_idx, &real_idx)| {
+                let (name, desc, active) = &items[real_idx];
+                let pointer = if display_idx == selected {
                     "\x1b[1;36m›\x1b[0m"
                 } else {
                     " "
@@ -8697,34 +9074,47 @@ fn select_menu_option_b(
                 let pad = name_width.saturating_sub(terminal_text_width(&name));
                 format!(
                     " {pointer} {check} {}. {name}{} {desc}",
-                    index + 1,
+                    display_idx + 1,
                     " ".repeat(pad)
                 )
             })
             .collect::<Vec<_>>();
-        let number_hint = if items.len() <= 9 {
-            format!("1–{} jump · ", items.len())
+
+        if rows.is_empty() {
+            rows.push(format!("   \x1b[38;5;244mNo matches found for \"{search_query}\"\x1b[0m"));
+        }
+
+        let menu_title = if search_query.is_empty() {
+            format!("{title} ({} items)", items.len())
         } else {
-            String::new()
+            format!("{title} ({} matches)", matching.len())
         };
-        frame.draw(
+
+        let footer = if search_query.is_empty() {
+            "  ↑/↓ move · Enter select · type to search · Esc cancel".to_string()
+        } else {
+            "  ↑/↓ move · Enter select · Backspace delete · Esc clear search".to_string()
+        };
+
+        frame.draw_with_search(
             stdout,
-            title,
+            &menu_title,
+            Some(search_query),
             &rows,
             selected,
-            &format!("  ↑/↓ move · Enter select · {number_hint}Esc cancel"),
+            &footer,
         )
     };
 
     write!(stdout, "\r\n").map_err(|e| format!("spacing menu: {e}"))?;
-    draw(&mut stdout, selected, true)?;
+    draw(&mut stdout, selected, &search_query, true)?;
 
     let result = loop {
         let event = event::read().map_err(|e| format!("reading menu key: {e}"))?;
         let key = match event {
             Event::Key(key) => key,
             Event::Resize(_, _) => {
-                draw(&mut stdout, selected, false)?;
+                draw(&mut stdout, selected, &search_query, false)?;
                 continue;
             }
             _ => continue,
@@ -8733,31 +9123,54 @@ fn select_menu_option_b(
             continue;
         }
         match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up => {
                 selected = selected.saturating_sub(1);
-                draw(&mut stdout, selected, false)?;
+                draw(&mut stdout, selected, &search_query, false)?;
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                selected = (selected + 1).min(items.len().saturating_sub(1));
-                draw(&mut stdout, selected, false)?;
+            KeyCode::Down => {
+                let matching = get_matching_indices(&search_query);
+                selected = (selected + 1).min(matching.len().saturating_sub(1));
+                draw(&mut stdout, selected, &search_query, false)?;
             }
-            KeyCode::Char(c) if c.is_ascii_digit() => {
-                if let Some(digit) = c.to_digit(10) {
-                    if let Some(idx) = (digit as usize).checked_sub(1) {
-                        if idx < items.len() {
-                            break Ok(Some(idx));
-                        }
-                    }
+            KeyCode::Left | KeyCode::PageUp => {
+                selected = selected.saturating_sub(10);
+                draw(&mut stdout, selected, &search_query, false)?;
+            }
+            KeyCode::Right | KeyCode::PageDown => {
+                let matching = get_matching_indices(&search_query);
+                selected = (selected + 10).min(matching.len().saturating_sub(1));
+                draw(&mut stdout, selected, &search_query, false)?;
+            }
+            KeyCode::Backspace => {
+                if !search_query.is_empty() {
+                    search_query.pop();
+                    selected = 0;
+                    draw(&mut stdout, selected, &search_query, false)?;
                 }
             }
             KeyCode::Enter => {
-                break Ok(Some(selected));
+                let matching = get_matching_indices(&search_query);
+                if !matching.is_empty() {
+                    let chosen_real_idx = matching[selected.min(matching.len().saturating_sub(1))];
+                    break Ok(Some(chosen_real_idx));
+                }
             }
-            KeyCode::Esc | KeyCode::Char('q') => {
-                break Ok(None);
+            KeyCode::Esc => {
+                if !search_query.is_empty() {
+                    search_query.clear();
+                    selected = 0;
+                    draw(&mut stdout, selected, &search_query, false)?;
+                } else {
+                    break Ok(None);
+                }
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 break Ok(None);
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                search_query.push(c);
+                selected = 0;
+                draw(&mut stdout, selected, &search_query, false)?;
             }
             _ => {}
         }
@@ -9607,6 +10020,7 @@ const HELP_USAGE: &[(&str, &str)] = &[
         "  nio completions <bash|zsh|fish>",
         "Print a shell completion script",
     ),
+    ("  nio voice", "Record microphone audio and query LLM"),
     ("  nio help [COMMAND]", "Show help for a command"),
     (
         "  nio --version (-v, --v, -V)",
@@ -9615,6 +10029,10 @@ const HELP_USAGE: &[(&str, &str)] = &[
 ];
 
 const HELP_OPTIONS: &[(&str, &str)] = &[
+    (
+        "      --voice",
+        "Record microphone audio and query LLM",
+    ),
     (
         "      --plugins [ACTION]",
         "Select/install optional plugins (list in scripts)",
@@ -9680,6 +10098,11 @@ const HELP_INTERACTIVE: &[(&str, &str)] = &[
         ":plugins",
         "Manage optional file readers and PDF OCR languages",
     ),
+    (
+        ":snippets",
+        "Manage and run custom snippets and functions",
+    ),
+    (":ide", "Manage NioDE server daemon"),
     (":clear", "Clear conversation history"),
     (":diff", "Show git diff of project changes"),
     (":undo", "Revert last file change made by Nio"),
@@ -9700,6 +10123,7 @@ const HELP_INTERACTIVE: &[(&str, &str)] = &[
         "Configure mode, reasoning, approvals, and settings",
     ),
     (":bash", "Direct shell prompt; :ai returns"),
+    (":voice", "Record audio and send voice input to LLM"),
     (":quit", "Exit"),
 ];
 
@@ -9887,6 +10311,54 @@ fn delete_session(id: &str) -> Result<(), CliError> {
     let _ = std::fs::remove_file(lock_path(&path));
     println!("Deleted session {id}.");
     Ok(())
+}
+
+async fn voice_command(mut options: Options) -> Result<(), String> {
+    println!("🎙️  Nio Voice Input");
+    println!("Speak into your microphone. Press Enter or Space when finished, Esc to cancel.\n");
+    let wav_path = match voice::record_voice_interactive()? {
+        Some(path) => path,
+        None => {
+            println!("Voice recording cancelled.");
+            return Ok(());
+        }
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|e| format!("building client: {e}"))?;
+
+    print!("Transcribing audio... ");
+    let _ = io::stdout().flush();
+    let transcript = voice::transcribe_audio(
+        &client,
+        &options.base_url,
+        options.api_key.as_deref(),
+        &wav_path,
+    )
+    .await;
+
+    match transcript {
+        Ok(text) => {
+            println!("\r\x1b[2K🎙️ Recognized: \"{text}\"\n");
+            options.prompt = vec![text];
+        }
+        Err(err) => {
+            println!(
+                "\r\x1b[2K🎙️ Audio recorded: {} (multimodal audio attachment: {err})",
+                wav_path.display()
+            );
+            println!("Sending multimodal audio to LLM...\n");
+            options.attachments.push(wav_path);
+            if options.prompt.is_empty() {
+                options.prompt =
+                    vec!["Please listen to this audio recording and respond.".to_string()];
+            }
+        }
+    }
+
+    chat(&options).await
 }
 
 fn config_command(options: &Options) -> Result<(), CliError> {
@@ -10664,7 +11136,7 @@ mod markdown_tests {
 
     #[test]
     fn streamed_tables_render_cells_and_align_visible_columns() {
-        let source = "| Feature | Description |\n|---|---|\n| **Agent** | *Helpful* `code` |\n| 模型 | Text |\n\n";
+        let source = "| Feature | Description |\n|---|---|\n| **Agent** | *Helpful* `code` |\n| Model | Text |\n\n";
         let mut formatter = MarkdownFormatter::new(true);
         formatter.wrap_width = 80;
         let mut out = String::new();
@@ -10686,6 +11158,22 @@ mod markdown_tests {
                 .iter()
                 .all(|line| terminal_text_width(line) == terminal_text_width(lines[0]))
         );
+    }
+
+    #[test]
+    fn unicode_tables_keep_all_values_without_fixed_width_borders() {
+        assert_eq!(terminal_text_width("កិ"), 1);
+        assert_eq!(terminal_text_width("e\u{301}"), 1);
+        assert_eq!(terminal_text_width("模型"), 4);
+        assert_eq!(terminal_text_width("👩‍💻"), 2);
+        assert_eq!(strip_terminal_ansi(&clip_terminal_text("👩‍💻abc", 3)), "👩‍💻…");
+        let source = "| Field | Value |\n|---|---|\n| Customer ID (លេខសម្គាល់អតិថិជន) | 101476310 |\n| Name | លោក សុវណ្ណមុនី |\n| Notes | é कि 模型 👩‍💻 |\n\n";
+        let output =
+            render_markdown_table(&source.lines().map(str::to_string).collect::<Vec<_>>(), 72);
+        assert!(!output.contains(['┌', '│', '…']));
+        assert!(output.contains("• Field: Customer ID (លេខសម្គាល់អតិថិជន)"));
+        assert!(output.contains("  Value: លោក សុវណ្ណមុនី"));
+        assert!(output.contains("  Value: é कि 模型 👩‍💻"));
     }
 
     #[test]
@@ -10962,3 +11450,27 @@ mod compact_edit_tests {
         assert!(deleted.contains("(+0 -2)") && deleted.contains("@@ -1,2 +0,0 @@"));
     }
 }
+
+#[cfg(test)]
+mod provider_failover_tests {
+    use super::*;
+
+    #[test]
+    fn detects_unreachable_and_transient_provider_errors() {
+        assert!(is_provider_unreachable_error("The model provider is temporarily unavailable (HTTP 503)."));
+        assert!(is_provider_unreachable_error("error sending request for url: connection refused"));
+        assert!(is_provider_unreachable_error("request timed out"));
+        assert!(is_provider_unreachable_error("dns error: failed to lookup address information"));
+        assert!(is_provider_unreachable_error("HTTP 502 Bad Gateway"));
+        assert!(is_provider_unreachable_error("HTTP 504 Gateway Timeout"));
+        assert!(is_provider_unreachable_error("Service Unavailable"));
+    }
+
+    #[test]
+    fn does_not_flag_auth_or_syntax_errors_as_unreachable() {
+        assert!(!is_provider_unreachable_error("Invalid API key (401)"));
+        assert!(!is_provider_unreachable_error("Prompt is too long for context"));
+        assert!(!is_provider_unreachable_error("user denied command"));
+    }
+}
+
