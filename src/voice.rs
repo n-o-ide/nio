@@ -303,20 +303,19 @@ pub async fn transcribe_audio(
     let mut last_error = "no transcription endpoints available".to_string();
 
     for endpoint in endpoints {
-        let (endpoint_url, key_to_use, model_name) =
-            if endpoint.contains("groq.com") {
-                let groq_key = std::env::var("GROQ_API_KEY")
-                    .ok()
-                    .or_else(|| api_key.map(str::to_string));
-                (endpoint, groq_key, "whisper-large-v3")
-            } else if endpoint.contains("openai.com") {
-                let openai_key = std::env::var("OPENAI_API_KEY")
-                    .ok()
-                    .or_else(|| api_key.map(str::to_string));
-                (endpoint, openai_key, "whisper-1")
-            } else {
-                (endpoint, api_key.map(str::to_string), "whisper-1")
-            };
+        let (endpoint_url, key_to_use, model_name) = if endpoint.contains("groq.com") {
+            let groq_key = std::env::var("GROQ_API_KEY")
+                .ok()
+                .or_else(|| api_key.map(str::to_string));
+            (endpoint, groq_key, "whisper-large-v3")
+        } else if endpoint.contains("openai.com") {
+            let openai_key = std::env::var("OPENAI_API_KEY")
+                .ok()
+                .or_else(|| api_key.map(str::to_string));
+            (endpoint, openai_key, "whisper-1")
+        } else {
+            (endpoint, api_key.map(str::to_string), "whisper-1")
+        };
 
         let file_part = reqwest::multipart::Part::bytes(file_bytes.clone())
             .file_name(file_name.clone())
@@ -364,12 +363,30 @@ mod tests {
 
     #[test]
     fn detects_supported_audio_formats() {
-        assert_eq!(supported_audio_mime(Path::new("speech.wav")), Some("audio/wav"));
-        assert_eq!(supported_audio_mime(Path::new("recording.mp3")), Some("audio/mp3"));
-        assert_eq!(supported_audio_mime(Path::new("voice.m4a")), Some("audio/m4a"));
-        assert_eq!(supported_audio_mime(Path::new("track.ogg")), Some("audio/ogg"));
-        assert_eq!(supported_audio_mime(Path::new("audio.flac")), Some("audio/flac"));
-        assert_eq!(supported_audio_mime(Path::new("note.webm")), Some("audio/webm"));
+        assert_eq!(
+            supported_audio_mime(Path::new("speech.wav")),
+            Some("audio/wav")
+        );
+        assert_eq!(
+            supported_audio_mime(Path::new("recording.mp3")),
+            Some("audio/mp3")
+        );
+        assert_eq!(
+            supported_audio_mime(Path::new("voice.m4a")),
+            Some("audio/m4a")
+        );
+        assert_eq!(
+            supported_audio_mime(Path::new("track.ogg")),
+            Some("audio/ogg")
+        );
+        assert_eq!(
+            supported_audio_mime(Path::new("audio.flac")),
+            Some("audio/flac")
+        );
+        assert_eq!(
+            supported_audio_mime(Path::new("note.webm")),
+            Some("audio/webm")
+        );
         assert_eq!(supported_audio_mime(Path::new("file.txt")), None);
         assert_eq!(supported_audio_mime(Path::new("image.png")), None);
     }

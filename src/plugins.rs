@@ -736,7 +736,11 @@ pub fn menu_entries(
         }
         entries.push(menu_entry(
             "Details",
-            format!("Extensions: .{} · Tags: {}", cat.extensions.join(", ."), cat.tags.join(", ")),
+            format!(
+                "Extensions: .{} · Tags: {}",
+                cat.extensions.join(", ."),
+                cat.tags.join(", ")
+            ),
             false,
             &["menu", ""],
         ));

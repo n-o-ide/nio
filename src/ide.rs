@@ -98,7 +98,8 @@ pub async fn install() -> Result<String, String> {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&target_bin, std::fs::Permissions::from_mode(0o755));
+                let _ =
+                    std::fs::set_permissions(&target_bin, std::fs::Permissions::from_mode(0o755));
             }
             return Ok(format!(
                 "Installed local nio-de from {} to {}",
@@ -106,7 +107,10 @@ pub async fn install() -> Result<String, String> {
                 target_bin.display()
             ));
         }
-        return Ok(format!("nio-de is already installed at {}", target_bin.display()));
+        return Ok(format!(
+            "nio-de is already installed at {}",
+            target_bin.display()
+        ));
     }
 
     // Platform detection for official release bundle download
@@ -116,7 +120,11 @@ pub async fn install() -> Result<String, String> {
         ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
         ("linux", "aarch64") => "aarch64-unknown-linux-gnu",
         ("windows", "x86_64") => "x86_64-pc-windows-msvc",
-        (os, arch) => return Err(format!("Unsupported platform for nio-de bundle: {os}-{arch}")),
+        (os, arch) => {
+            return Err(format!(
+                "Unsupported platform for nio-de bundle: {os}-{arch}"
+            ));
+        }
     };
 
     Ok(format!(
@@ -129,8 +137,7 @@ pub fn start(port: Option<u16>) -> Result<String, String> {
     if let Some(pid) = is_running() {
         return Ok(format!("NioDE server is already running (PID: {pid})."));
     }
-    let binary = find_binary()
-        .ok_or("nio-de binary not found. Run 'nio ide install' first.")?;
+    let binary = find_binary().ok_or("nio-de binary not found. Run 'nio ide install' first.")?;
     let port_str = port.unwrap_or(8080).to_string();
 
     let child = std::process::Command::new(&binary)

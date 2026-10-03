@@ -886,7 +886,10 @@ async fn run() -> Result<(), CliError> {
     .map_err(|e| format!("setting interruption handler: {e}"))?;
     let mut options = parse_args(env::args().skip(1).collect()).map_err(CliError::usage)?;
     let json_run = options.json_output && options.command == "run";
-    let trust_outcome = if matches!(options.command.as_str(), "interactive" | "tui" | "run" | "voice") {
+    let trust_outcome = if matches!(
+        options.command.as_str(),
+        "interactive" | "tui" | "run" | "voice"
+    ) {
         confirm_project_trust(&options).map_err(CliError::from)
     } else {
         Ok(options.project_trusted)
@@ -6318,7 +6321,9 @@ async fn interactive(mut options: Options) -> Result<(), String> {
                     break;
                 }
                 Err(error) if is_provider_unreachable_error(&error) => {
-                    eprintln!("\n⚠️  Provider is unreachable or temporarily unavailable: {error}\n");
+                    eprintln!(
+                        "\n⚠️  Provider is unreachable or temporarily unavailable: {error}\n"
+                    );
                     if io::stdin().is_terminal() && io::stdout().is_terminal() {
                         let fallback_choices = [
                             (
@@ -6798,10 +6803,7 @@ const COMMANDS: [(&str, &str); 27] = [
         "Configure mode, reasoning, approvals, and other settings",
     ),
     (":skills", "List/add/remove/enable/disable GitHub skills"),
-    (
-        ":snippets",
-        "Manage and run custom snippets and functions",
-    ),
+    (":snippets", "Manage and run custom snippets and functions"),
     (
         ":stop",
         "Stop the current response; preserve queued messages",
@@ -7638,10 +7640,7 @@ fn render_inline_menu_with_search(
             "\x1b[38;5;244m│\x1b[0m{clipped_search}{}\x1b[38;5;244m│\x1b[0m\r\n",
             " ".repeat(inner.saturating_sub(terminal_text_width(&clipped_search)))
         ));
-        output.push_str(&format!(
-            "\x1b[38;5;244m├{}┤\x1b[0m\r\n",
-            "─".repeat(inner)
-        ));
+        output.push_str(&format!("\x1b[38;5;244m├{}┤\x1b[0m\r\n", "─".repeat(inner)));
     }
 
     for row in &rows[start..end] {
@@ -9044,14 +9043,20 @@ fn select_menu_option_b(
                 .filter(|(_, (name, desc, _))| {
                     let n = name.to_ascii_lowercase();
                     let d = desc.to_ascii_lowercase();
-                    terms.iter().all(|term| n.contains(term) || d.contains(term))
+                    terms
+                        .iter()
+                        .all(|term| n.contains(term) || d.contains(term))
                 })
                 .map(|(idx, _)| idx)
                 .collect()
         }
     };
 
-    let mut draw = |stdout: &mut io::Stdout, selected: usize, search_query: &str, _first: bool| -> Result<(), String> {
+    let mut draw = |stdout: &mut io::Stdout,
+                    selected: usize,
+                    search_query: &str,
+                    _first: bool|
+     -> Result<(), String> {
         let matching = get_matching_indices(search_query);
         let name_width = matching
             .iter()
@@ -9081,7 +9086,9 @@ fn select_menu_option_b(
             .collect::<Vec<_>>();
 
         if rows.is_empty() {
-            rows.push(format!("   \x1b[38;5;244mNo matches found for \"{search_query}\"\x1b[0m"));
+            rows.push(format!(
+                "   \x1b[38;5;244mNo matches found for \"{search_query}\"\x1b[0m"
+            ));
         }
 
         let menu_title = if search_query.is_empty() {
@@ -10029,10 +10036,7 @@ const HELP_USAGE: &[(&str, &str)] = &[
 ];
 
 const HELP_OPTIONS: &[(&str, &str)] = &[
-    (
-        "      --voice",
-        "Record microphone audio and query LLM",
-    ),
+    ("      --voice", "Record microphone audio and query LLM"),
     (
         "      --plugins [ACTION]",
         "Select/install optional plugins (list in scripts)",
@@ -10098,10 +10102,7 @@ const HELP_INTERACTIVE: &[(&str, &str)] = &[
         ":plugins",
         "Manage optional file readers and PDF OCR languages",
     ),
-    (
-        ":snippets",
-        "Manage and run custom snippets and functions",
-    ),
+    (":snippets", "Manage and run custom snippets and functions"),
     (":ide", "Manage NioDE server daemon"),
     (":clear", "Clear conversation history"),
     (":diff", "Show git diff of project changes"),
@@ -11457,10 +11458,16 @@ mod provider_failover_tests {
 
     #[test]
     fn detects_unreachable_and_transient_provider_errors() {
-        assert!(is_provider_unreachable_error("The model provider is temporarily unavailable (HTTP 503)."));
-        assert!(is_provider_unreachable_error("error sending request for url: connection refused"));
+        assert!(is_provider_unreachable_error(
+            "The model provider is temporarily unavailable (HTTP 503)."
+        ));
+        assert!(is_provider_unreachable_error(
+            "error sending request for url: connection refused"
+        ));
         assert!(is_provider_unreachable_error("request timed out"));
-        assert!(is_provider_unreachable_error("dns error: failed to lookup address information"));
+        assert!(is_provider_unreachable_error(
+            "dns error: failed to lookup address information"
+        ));
         assert!(is_provider_unreachable_error("HTTP 502 Bad Gateway"));
         assert!(is_provider_unreachable_error("HTTP 504 Gateway Timeout"));
         assert!(is_provider_unreachable_error("Service Unavailable"));
@@ -11469,8 +11476,9 @@ mod provider_failover_tests {
     #[test]
     fn does_not_flag_auth_or_syntax_errors_as_unreachable() {
         assert!(!is_provider_unreachable_error("Invalid API key (401)"));
-        assert!(!is_provider_unreachable_error("Prompt is too long for context"));
+        assert!(!is_provider_unreachable_error(
+            "Prompt is too long for context"
+        ));
         assert!(!is_provider_unreachable_error("user denied command"));
     }
 }
-

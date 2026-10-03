@@ -154,7 +154,12 @@ pub fn run(root: &Path, name: &str, args: &[String]) -> Result<String, String> {
     let runner = if let Some(r) = &snippet.runner {
         r.clone()
     } else {
-        match snippet.path.extension().and_then(|e| e.to_str()).unwrap_or_default() {
+        match snippet
+            .path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default()
+        {
             "py" => "python3".to_string(),
             "sh" => "bash".to_string(),
             "js" => "node".to_string(),
@@ -199,11 +204,12 @@ pub fn run(root: &Path, name: &str, args: &[String]) -> Result<String, String> {
 
 pub fn add(root: &Path, source: &Path, global: bool) -> Result<String, String> {
     if !source.is_file() {
-        return Err(format!("source snippet file '{}' does not exist", source.display()));
+        return Err(format!(
+            "source snippet file '{}' does not exist",
+            source.display()
+        ));
     }
-    let filename = source
-        .file_name()
-        .ok_or("source file has no name")?;
+    let filename = source.file_name().ok_or("source file has no name")?;
 
     let target_dir = if global {
         let dir = global_snippets_dir()?;
@@ -264,13 +270,17 @@ pub fn command(root: &Path, args: &[String]) -> Result<(), String> {
             println!("{}", read(root, name)?);
         }
         "run" => {
-            let name = args.get(1).ok_or("usage: nio snippets run <name> [args...]")?;
+            let name = args
+                .get(1)
+                .ok_or("usage: nio snippets run <name> [args...]")?;
             let snippet_args = args.iter().skip(2).cloned().collect::<Vec<_>>();
             let output = run(root, name, &snippet_args)?;
             print!("{output}");
         }
         "add" => {
-            let source_path = args.get(1).ok_or("usage: nio snippets add <file> [--global]")?;
+            let source_path = args
+                .get(1)
+                .ok_or("usage: nio snippets add <file> [--global]")?;
             let is_global = args.iter().any(|a| a == "--global" || a == "-g");
             println!("{}", add(root, Path::new(source_path), is_global)?);
         }
